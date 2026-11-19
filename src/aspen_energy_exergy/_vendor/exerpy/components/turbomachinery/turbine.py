@@ -1,0 +1,558 @@
+import numpy as np
+
+from exerpy.components.component import Component
+from exerpy.components.component import component_registry
+from exerpy.components.component import set_equal_specific_cost
+from exerpy.logger import logger
+
+
+@component_registry
+class Turbine(Component):
+    r"""
+    Class for exergy analysis of turbines.
+
+    This class performs exergy analysis calculations for turbines, with definitions
+    of exergy product and fuel varying based on the temperature relationships between
+    inlet stream, outlet stream, and ambient conditions.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Arbitrary keyword arguments passed to parent class.
+
+    Attributes
+    ----------
+    E_F : float
+        Exergy fuel of the component :math:`\dot{E}_\mathrm{F}` in :math:`\mathrm{W}`.
+    E_P : float
+        Exergy product of the component :math:`\dot{E}_\mathrm{P}` in :math:`\mathrm{W}`.
+    E_D : float
+        Exergy destruction of the component :math:`\dot{E}_\mathrm{D}` in :math:`\mathrm{W}`.
+    epsilon : float
+        Exergetic efficiency of the component :math:`\varepsilon` in :math:`-`.
+    P : float
+        Power output of the turbine in :math:`\mathrm{W}`.
+    inl : dict
+        Dictionary containing inlet stream data with temperature, mass flows,
+        enthalpies, and specific exergies. Must have at least one inlet.
+    outl : dict
+        Dictionary containing outlet streams data with temperature, mass flows,
+        enthalpies, and specific exergies. Can have multiple outlets, their
+        properties will be summed up in the calculations.
+
+    Notes
+    -----
+    The exergy analysis considers three cases based on temperature relationships:
+
+    .. math::
+
+        \dot{E}_\mathrm{P} =
+        \begin{cases}
+        -P & T_\mathrm{in}, T_\mathrm{out} \geq T_0\\
+        -P + \dot{E}_\mathrm{out}^\mathrm{T}
+        & T_\mathrm{in} > T_0 \geq T_\mathrm{out}\\
+        -P + \dot{E}_\mathrm{out}^\mathrm{T} - \dot{E}_\mathrm{in}^\mathrm{T}
+        & T_0 \geq T_\mathrm{in}, T_\mathrm{out}
+        \end{cases}
+
+        \dot{E}_\mathrm{F} =
+        \begin{cases}
+        \dot{E}_\mathrm{in}^\mathrm{PH} - \dot{E}_\mathrm{out}^\mathrm{PH}
+        & T_\mathrm{in}, T_\mathrm{out} \geq T_0\\
+        \dot{E}_\mathrm{in}^\mathrm{T} + \dot{E}_\mathrm{in}^\mathrm{M} -
+        \dot{E}_\mathrm{out}^\mathrm{M}
+        & T_\mathrm{in} > T_0 \geq T_\mathrm{out}\\
+        \dot{E}_\mathrm{in}^\mathrm{M} - \dot{E}_\mathrm{out}^\mathrm{M}
+        & T_0 \geq T_\mathrm{in}, T_\mathrm{out}
+        \end{cases}
+    """
+
+    def __init__(self, **kwargs):
+        r"""Initialize turbine component with given parameters."""
+        super().__init__(**kwargs)
+        self.P = None
+
+    def calc_exergy_balance(self, T0: float, p0: float, split_physical_exergy) -> None:
+        r"""
+        Calculate the exergy balance of the turbine.
+
+        Performs exergy balance calculations considering the temperature relationships
+        between inlet stream, outlet stream, and ambient conditions.
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature in :math:`\mathrm{K}`.
+        p0 : float
+            Ambient pressure in :math:`\mathrm{Pa}`.
+        split_physical_exergy : bool
+            Flag indicating whether physical exergy is split into thermal and mechanical components.
+
+        Notes
+        -----
+        Below the ambient temperature the expansion produces cold exergy along with the power.
+        Crediting it to the product requires the thermal part of the physical exergy, so with
+        ``split_physical_exergy=False`` the balance falls back to
+
+        .. math::
+
+            \dot{E}_\mathrm{P} = |P| \qquad
+            \dot{E}_\mathrm{F} = \dot{E}^\mathrm{PH}_\mathrm{in} - \sum \dot{E}^\mathrm{PH}_\mathrm{out}
+
+        which leaves the cold exergy in the outlet stream instead of counting it as product. The
+        exergy destruction is the same either way, the exergetic efficiency is not.
+        """
+        # Get net power flow
+        net_power = 0.0  # Initialize to 0.0, not None
+        for idx, conn in self.inl.items():
+            if conn is not None and conn.get("kind") == "power" and "energy_flow" in conn:
+                net_power -= conn["energy_flow"]  # Subtract inlet power
+        for idx, conn in self.outl.items():
+            if conn is not None and conn.get("kind") == "power" and "energy_flow" in conn:
+                net_power += conn["energy_flow"]  # Add outlet power
+
+        # Use net_power if available, otherwise calculate from enthalpy balance
+        if net_power != 0.0:
+            self.P = abs(net_power)
+        else:
+            self.P = self._total_outlet("m", "h") - self.inl[0]["m"] * self.inl[0]["h"]
+
+        # Representative ("main") outlet used to select the temperature regime below.
+        # Do not assume it sits at index 0: a model may wire the single outlet to an
+        # extraction port (e.g. 3/4) instead of the main outlet port (2). Use the
+        # lowest-indexed material outlet that is actually present.
+        main_out = self._main_outlet()
+        if main_out is None:
+            msg = f"Turbine {self.name} has no material outlet connection to evaluate."
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # Case 1: Both temperatures above ambient (a liquid may leave slightly warmer)
+        if self.inl[0]["T"] >= T0 and main_out["T"] >= T0:
+            self.E_P = abs(self.P)
+            self.E_F = self.inl[0]["m"] * self.inl[0]["e_PH"] - self._total_outlet("m", "e_PH")
+
+        # Case 2: Inlet above, outlet at/below ambient
+        elif self.inl[0]["T"] > T0 and main_out["T"] <= T0:
+            if split_physical_exergy:
+                self.E_P = abs(self.P) + self._total_outlet("m", "e_T")
+                self.E_F = (
+                    self.inl[0]["m"] * self.inl[0]["e_T"]
+                    + self.inl[0]["m"] * self.inl[0]["e_M"]
+                    - self._total_outlet("m", "e_M")
+                )
+            else:
+                logger.warning(
+                    f"Turbine {self.name} expands below the ambient temperature: without split physical "
+                    "exergy, only the power output is counted as product and the cold exergy of the outlet "
+                    "stays in the stream. Split the physical exergy to credit it to the product."
+                )
+                self.E_P = abs(self.P)
+                self.E_F = self.inl[0]["m"] * self.inl[0]["e_PH"] - self._total_outlet("m", "e_PH")
+
+        # Case 3: Both temperatures at/below ambient
+        elif self.inl[0]["T"] <= T0 and main_out["T"] <= T0:
+            if split_physical_exergy:
+                self.E_P = abs(self.P) + (self._total_outlet("m", "e_T") - self.inl[0]["m"] * self.inl[0]["e_T"])
+                self.E_F = self.inl[0]["m"] * self.inl[0]["e_M"] - self._total_outlet("m", "e_M")
+            else:
+                logger.warning(
+                    f"Turbine {self.name} expands below the ambient temperature: without split physical "
+                    "exergy, only the power output is counted as product and the cold exergy of the outlet "
+                    "stays in the stream. Split the physical exergy to credit it to the product."
+                )
+                self.E_P = abs(self.P)
+                self.E_F = self.inl[0]["m"] * self.inl[0]["e_PH"] - self._total_outlet("m", "e_PH")
+        # Inlet below and outlet above the ambient temperature
+        else:
+            logger.warning(
+                f"Exergy balance of turbine {self.name} with the inlet below and the outlet above the ambient "
+                "temperature is not implemented; its exergy destruction is taken from the balance."
+            )
+            self.E_P = np.nan
+            self.E_F = np.nan
+
+        # Calculate exergy destruction and efficiency
+        self.E_D = self.E_F - self.E_P
+        if np.isnan(self.E_F):
+            self.E_D = self.inl[0]["m"] * self.inl[0]["e_PH"] - self._total_outlet("m", "e_PH") - abs(self.P)
+        self.epsilon = self.calc_epsilon()
+
+        # Log the results
+        logger.info(
+            f"Exergy balance of Turbine {self.name} calculated: "
+            f"E_P={self.E_P:.2f}, E_F={self.E_F:.2f}, E_D={self.E_D:.2f}, "
+            f"Efficiency={self.epsilon:.2%}"
+        )
+
+    def _total_outlet(self, mass_flow: str, property_name: str) -> float:
+        r"""
+        Calculate the sum of mass flow times property across all outlets.
+
+        Parameters
+        ----------
+        mass_flow : str
+            Key for the mass flow value.
+        property_name : str
+            Key for the property to be summed.
+
+        Returns
+        -------
+        float
+            Sum of mass flow times property across all outlets.
+        """
+        total = 0.0
+        for outlet in self.outl.values():
+            # Skip power connections; treat missing "kind" as material for backward compatibility
+            if outlet and outlet.get("kind", "material") != "power" and mass_flow in outlet and property_name in outlet:
+                total += outlet[mass_flow] * outlet[property_name]
+        return total
+
+    def _main_outlet(self):
+        r"""
+        Return the representative material outlet of the turbine.
+
+        The "main" outlet is taken as the material (non-power) outlet with the
+        smallest connector index that is actually present. This avoids assuming
+        the main outlet is stored at index 0: a model may wire the single outlet
+        to an extraction port instead of the dedicated main outlet port.
+
+        Returns
+        -------
+        dict or None
+            The representative outlet stream, or ``None`` if no material outlet
+            is connected.
+        """
+        material_outlets = {
+            idx: outlet
+            for idx, outlet in self.outl.items()
+            if outlet is not None and outlet.get("kind", "material") != "power"
+        }
+        if not material_outlets:
+            return None
+        return material_outlets[min(material_outlets)]
+
+    def aux_eqs(self, A, b, counter, T0, equations, chemical_exergy_enabled, split_physical_exergy=True):
+        r"""
+        Auxiliary equations for the turbine.
+
+        The power is the product of the turbine and the expanding stream is its fuel, so every cost
+        variable the stream carries follows the F-principle: it leaves the component at the specific
+        cost at which it entered.
+
+        With split physical exergy, for every material outlet:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{T}_\mathrm{in}}{\dot{E}^\mathrm{T}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{T}_\mathrm{out}}{\dot{E}^\mathrm{T}_\mathrm{out}}
+            \qquad
+            \frac{\dot{C}^\mathrm{M}_\mathrm{in}}{\dot{E}^\mathrm{M}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{M}_\mathrm{out}}{\dot{E}^\mathrm{M}_\mathrm{out}}
+
+        Without the split the stream carries a single cost variable for its physical exergy, and the
+        two rules above collapse into one:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{PH}_\mathrm{in}}{\dot{E}^\mathrm{PH}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{PH}_\mathrm{out}}{\dot{E}^\mathrm{PH}_\mathrm{out}}
+
+        With chemical exergy enabled, either way:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{CH}_\mathrm{in}}{\dot{E}^\mathrm{CH}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{CH}_\mathrm{out}}{\dot{E}^\mathrm{CH}_\mathrm{out}}
+
+        The power leaving the turbine is one single product, so all of its outlets are priced alike
+        (P-principle), against the first of them that carries power:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{TOT}_\mathrm{ref}}{\dot{E}^\mathrm{TOT}_\mathrm{ref}}
+            = \frac{\dot{C}^\mathrm{TOT}_\mathrm{out}}{\dot{E}^\mathrm{TOT}_\mathrm{out}}
+
+        Expanding below the ambient temperature is only resolved with the split. Without it the
+        component warns and charges the outlet with the specific cost of the physical exergy of the
+        inlet; with it, the case is not implemented and no equation is written.
+
+        Parameters
+        ----------
+        A : numpy.ndarray
+            The current cost matrix.
+        b : numpy.ndarray
+            The current right-hand-side vector.
+        counter : int
+            The current row index in the matrix.
+        T0 : float
+            Ambient temperature.
+        equations : list or dict
+            Data structure for storing equation labels.
+        chemical_exergy_enabled : bool
+            Flag indicating whether chemical exergy auxiliary equations should be added.
+        split_physical_exergy : bool, optional
+            If True, the physical exergy of a material stream is split into a thermal and a
+            mechanical share, each with its own cost variable. If False, the stream carries a
+            single cost variable for its physical exergy. Default is True.
+
+        Returns
+        -------
+        A : numpy.ndarray
+            The updated cost matrix.
+        b : numpy.ndarray
+            The updated right-hand-side vector.
+        counter : int
+            The updated row index after adding all auxiliary equations.
+        equations : list or dict
+            Updated structure with equation labels.
+        """
+        if split_physical_exergy:
+            # The thermal exergy gets its own rule per outlet below.
+            labels = ["M"]
+        else:
+            labels = ["PH"]
+            if self.inl[0]["T"] <= T0 or self.outl[0]["T"] <= T0:
+                logger.warning(
+                    f"Turbine {self.name} expands below the ambient temperature: without split physical exergy, "
+                    "the cost of the outlet stream is charged with the specific cost of the physical exergy of "
+                    "the inlet instead of being resolved into a thermal and a mechanical share."
+                )
+        if chemical_exergy_enabled:
+            labels.append("CH")
+
+        material_outlets = [outlet for outlet in self.outl.values() if outlet.get("kind") == "material"]
+        inlet = self.inl[0]
+        for outlet in material_outlets:
+            for label in labels:
+                set_equal_specific_cost(A, counter, inlet, outlet, label)
+                b[counter] = 0
+                equations[counter] = {
+                    "kind": "aux_equality" if label == "CH" else "aux_f_rule",
+                    "objects": [self.name, inlet["name"], outlet["name"]],
+                    "property": f"c_{label}",
+                }
+                counter += 1
+
+        if split_physical_exergy:
+            counter = self._thermal_rows(A, b, counter, T0, equations, inlet, material_outlets)
+
+        # --- Auxiliary equation for shaft power equality ---
+        power_outlets = [
+            outlet
+            for outlet in self.outl.values()
+            if outlet.get("kind") == "power" and outlet.get("source_component") and outlet.get("target_component")
+        ]
+        if len(power_outlets) > 1:
+            ref = next((outlet for outlet in power_outlets if outlet["E"] != 0), power_outlets[0])
+            for outlet in power_outlets:
+                if outlet is ref:
+                    continue
+                set_equal_specific_cost(A, counter, ref, outlet, "exergy", ref_is_outlet=True)
+                b[counter] = 0
+                equations[counter] = {
+                    "kind": "aux_p_rule",
+                    "objects": [self.name],
+                    "property": "c_TOT (more power flows)",
+                }
+                counter += 1
+
+        return A, b, counter, equations
+
+    def _thermal_rows(self, A, b, counter, T0, equations, inlet, material_outlets):
+        r"""
+        Write the rows for the thermal exergy of each material outlet with split physical exergy.
+
+        Above the ambient temperature the thermal exergy is fuel and keeps its specific cost
+        (F-principle). At or below it the thermal exergy of the outlet is product, so it costs as much
+        per unit as the power (P-principle) :cite:`lazzaretto2006speco`: its whole value when the inlet
+        is above the ambient temperature, its increase when both are below. :math:`k` is the share of
+        the inlet mass flow that leaves through the outlet.
+
+        .. math::
+
+            \frac{\dot C^\mathrm{T}_\mathrm{out}}{\dot E^\mathrm{T}_\mathrm{out}}
+            = \frac{\dot C_W}{\dot W}
+            \qquad \text{or} \qquad
+            \frac{\dot C^\mathrm{T}_\mathrm{out} - k\,\dot C^\mathrm{T}_\mathrm{in}}
+            {\dot E^\mathrm{T}_\mathrm{out} - k\,\dot E^\mathrm{T}_\mathrm{in}}
+            = \frac{\dot C_W}{\dot W}
+        """
+        power = [o for o in self.outl.values() if o.get("kind") == "power"]
+        for outlet in material_outlets:
+            if inlet["T"] >= T0 and outlet["T"] >= T0:
+                set_equal_specific_cost(A, counter, inlet, outlet, "T")
+                kind = "aux_f_rule"
+            else:
+                if not power or not power[0].get("E"):
+                    raise ValueError(
+                        f"Turbine {self.name} expands below the ambient temperature, so the cost of the thermal "
+                        "exergy of its outlet follows the cost of its power, but it has no power outlet."
+                    )
+                W = power[0]["E"]
+                k = outlet["m"] / inlet["m"] if inlet["m"] else 0.0
+                col_out = outlet["CostVar_index"]["T"]
+                col_in = inlet["CostVar_index"]["T"]
+                if inlet["T"] > T0:
+                    dE = outlet["E_T"]
+                    A[counter, col_out] = 1 / dE if dE else 1
+                else:
+                    dE = outlet["E_T"] - k * inlet["E_T"]
+                    A[counter, col_out] = 1 / dE if dE else 1
+                    A[counter, col_in] = -k / dE if dE else -k
+                if dE:
+                    A[counter, power[0]["CostVar_index"]["exergy"]] = -1 / W
+                kind = "aux_p_rule"
+            b[counter] = 0
+            equations[counter] = {
+                "kind": kind,
+                "objects": [self.name, inlet["name"], outlet["name"]],
+                "property": "c_T",
+            }
+            counter += 1
+        return counter
+
+    def exergoeconomic_balance(self, T0, chemical_exergy_enabled=False, split_physical_exergy=True):
+        r"""
+        Perform exergoeconomic cost balance for the turbine.
+
+        The general exergoeconomic balance equation is:
+
+        .. math::
+            \dot{C}^{\mathrm{T}}_{\mathrm{in}}
+            + \dot{C}^{\mathrm{M}}_{\mathrm{in}}
+            - \dot{C}^{\mathrm{T}}_{\mathrm{out}}
+            - \dot{C}^{\mathrm{M}}_{\mathrm{out}}
+            + \dot{Z}
+            = 0
+
+        In case the chemical exergy of the streams is known:
+
+        .. math::
+            \dot{C}^{\mathrm{CH}}_{\mathrm{in}} =
+            \dot{C}^{\mathrm{CH}}_{\mathrm{out}}
+
+        This method computes cost rates for product and fuel, and derives
+        exergoeconomic indicators. The turbine may have multiple power outputs
+        and multiple material outlets. The product cost includes the total cost
+        of all power streams, while material outlet costs are summed accordingly.
+
+        **Case 1: Inlet and outlet above ambient temperature**
+
+        Both inlet and first material outlet satisfy :math:`T \geq T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \sum \dot{C}^{\mathrm{TOT}}_{\mathrm{power,out}}
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{PH}}_{\mathrm{in}}
+            - \sum \dot{C}^{\mathrm{PH}}_{\mathrm{material,out}}
+
+        **Case 2: Inlet above and outlet at or below ambient temperature**
+
+        Inlet satisfies :math:`T > T_0` and first material outlet :math:`T \leq T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \sum \dot{C}^{\mathrm{TOT}}_{\mathrm{power,out}}
+            + \sum \dot{C}^{\mathrm{T}}_{\mathrm{material,out}}
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{T}}_{\mathrm{in}}
+            + \bigl(\dot{C}^{\mathrm{M}}_{\mathrm{in}}
+            - \sum \dot{C}^{\mathrm{M}}_{\mathrm{material,out}}\bigr)
+
+        **Case 3: Both inlet and outlet at or below ambient temperature**
+
+        Both inlet and first material outlet satisfy :math:`T \leq T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \sum \dot{C}^{\mathrm{TOT}}_{\mathrm{power,out}}
+            + \bigl(\sum \dot{C}^{\mathrm{T}}_{\mathrm{material,out}}
+            - \dot{C}^{\mathrm{T}}_{\mathrm{in}}\bigr)
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{M}}_{\mathrm{in}}
+            - \sum \dot{C}^{\mathrm{M}}_{\mathrm{material,out}}
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature (K).
+        chemical_exergy_enabled : bool, optional
+            If True, chemical exergy is considered in the calculations.
+            Default is False.
+        split_physical_exergy : bool, optional
+            If True, the physical exergy of a material stream is split into a thermal and a
+            mechanical share, each with its own cost variable. If False, the stream carries a
+            single cost variable for its physical exergy. Default is True.
+
+        Attributes Set
+        --------------
+        C_P : float
+            Cost rate of product (currency/time).
+        C_F : float
+            Cost rate of fuel (currency/time).
+        c_P : float
+            Specific cost of product (currency/energy).
+        c_F : float
+            Specific cost of fuel (currency/energy).
+        C_D : float
+            Cost rate of exergy destruction (currency/time).
+        r : float
+            Relative cost difference (dimensionless).
+        f : float
+            Exergoeconomic factor (dimensionless).
+        """
+        # The cost of the power the turbine delivers. A stage of a turbine train may sit on a shaft
+        # that already carries the power of the stages before it, and then only the power it adds is
+        # its own product, exactly as in the exergy balance.
+        C_power_out = sum(
+            stream.get("C_TOT", 0) for stream in self.outl.values() if stream.get("kind") == "power"
+        ) - sum(stream.get("C_TOT", 0) for stream in self.inl.values() if stream.get("kind") == "power")
+        # Assume a single primary inlet for material cost properties; the outlet that decides the
+        # temperature case is the same as in the exergy balance.
+        inlet = self.inl[0]
+        main_out = self._main_outlet()
+        # Filter material outlets and sum their cost components.
+        material_outlets = [out for out in self.outl.values() if out.get("kind") == "material"]
+        sum_C_PH_out = sum(out.get("C_PH", 0) for out in material_outlets)
+        sum_C_T_out = sum(out.get("C_T", 0) for out in material_outlets)
+        sum_C_M_out = sum(out.get("C_M", 0) for out in material_outlets)
+
+        # Case 1: Both inlet and first outlet above ambient. Below the ambient temperature the split is
+        # needed to charge the cold exergy of the outlet to the product, so without it the power stays
+        # the only product and the definition of case 1 holds in every temperature case.
+        if not split_physical_exergy or (inlet["T"] >= T0 and main_out["T"] >= T0):
+            self.C_P = C_power_out
+            self.C_F = inlet.get("C_PH", 0) - sum_C_PH_out
+
+        # Case 2: Inlet above ambient and outlet at or below ambient.
+        elif inlet["T"] > T0 and main_out["T"] <= T0:
+            self.C_P = C_power_out + sum_C_T_out
+            self.C_F = inlet.get("C_T", 0) + (inlet.get("C_M", 0) - sum_C_M_out)
+
+        # Case 3: Both inlet and outlet at or below ambient.
+        elif inlet["T"] <= T0 and main_out["T"] <= T0:
+            self.C_P = C_power_out + (sum_C_T_out - inlet.get("C_T", 0))
+            self.C_F = inlet.get("C_M", 0) - sum_C_M_out
+
+        else:
+            logger.warning(
+                "Exergoeconomic balance of a turbine whose inlet is below and outlet above the ambient "
+                "temperature is not implemented."
+            )
+            self.C_P = np.nan
+            self.C_F = np.nan
+
+        # Calculate the specific cost terms and exergoeconomic parameters.
+        self.c_F = self.C_F / self.E_F if self.E_F else np.nan
+        self.c_P = self.C_P / self.E_P if self.E_P else np.nan
+        self.C_D = self.c_F * self.E_D
+        self.r = (self.c_P - self.c_F) / self.c_F if self.c_F else np.nan
+        self.f = self.Z_costs / (self.Z_costs + self.C_D) if (self.Z_costs + self.C_D) else np.nan

@@ -1,0 +1,484 @@
+import numpy as np
+
+from exerpy.components.component import Component
+from exerpy.components.component import component_registry
+from exerpy.components.component import set_equal_specific_cost
+from exerpy.logger import logger
+
+
+@component_registry
+class Compressor(Component):
+    r"""
+    Class for exergy and exergoeconomic analysis of compressors.
+
+    This class performs exergy and exergoeconomic analysis calculations for compressors,
+    considering thermal, mechanical, and physical exergy flows. The exergy product and fuel
+    are calculated based on temperature relationships between inlet, outlet, and ambient conditions.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Arbitrary keyword arguments passed to parent class.
+        Optional parameter 'Z_costs' (float): Investment cost rate of the component in currency/h.
+
+    Attributes
+    ----------
+    E_F : float
+        Exergy fuel of the component :math:`\dot{E}_\mathrm{F}` in :math:`\mathrm{W}`.
+    E_P : float
+        Exergy product of the component :math:`\dot{E}_\mathrm{P}` in :math:`\mathrm{W}`.
+    E_D : float
+        Exergy destruction of the component :math:`\dot{E}_\mathrm{D}` in :math:`\mathrm{W}`.
+    epsilon : float
+        Exergetic efficiency of the component :math:`\varepsilon` in :math:`-`.
+    P : float
+        Power input to the compressor in :math:`\mathrm{W}`.
+    inl : dict
+        Dictionary containing inlet stream data with temperature, mass flows,
+        enthalpies, and specific exergies.
+    outl : dict
+        Dictionary containing outlet stream data with temperature, mass flows,
+        enthalpies, and specific exergies.
+    Z_costs : float
+        Investment cost rate of the component in currency/h.
+
+    Notes
+    -----
+    The exergy analysis considers three cases based on temperature relationships:
+
+    Case 1 - **Both temperatures at or above ambient** (:math:`T_\mathrm{in}, T_\mathrm{out} \geq T_0`):
+
+    .. math::
+
+        \dot{E}_\mathrm{P} &= \dot{m} \cdot (e_\mathrm{out}^\mathrm{PH} -
+        e_\mathrm{in}^\mathrm{PH})\\
+        \dot{E}_\mathrm{F} &= |\dot{W}|
+
+    Case 2 - **Inlet below, outlet above ambient** (:math:`T_\mathrm{in} < T_0 < T_\mathrm{out}`):
+
+    .. math::
+
+        \dot{E}_\mathrm{P} &= \dot{m} \cdot e_\mathrm{out}^\mathrm{T} +
+        \dot{m} \cdot (e_\mathrm{out}^\mathrm{M} - e_\mathrm{in}^\mathrm{M})\\
+        \dot{E}_\mathrm{F} &= |\dot{W}| + \dot{m} \cdot e_\mathrm{in}^\mathrm{T}
+
+    Case 3 - **Both temperatures below ambient** (:math:`T_\mathrm{in}, T_\mathrm{out} \leq T_0`):
+
+    .. math::
+
+        \dot{E}_\mathrm{P} &= \dot{m} \cdot (e_\mathrm{out}^\mathrm{M} -
+        e_\mathrm{in}^\mathrm{M})\\
+        \dot{E}_\mathrm{F} &= |\dot{W}| + \dot{m} \cdot (e_\mathrm{in}^\mathrm{T}
+        - e_\mathrm{out}^\mathrm{T})
+
+    For all valid cases, the exergy destruction is:
+
+    .. math::
+
+        \dot{E}_\mathrm{D} = \dot{E}_\mathrm{F} - \dot{E}_\mathrm{P}
+
+    where:
+        - :math:`\dot{W}`: Power input
+        - :math:`e^\mathrm{T}`: Thermal exergy
+        - :math:`e^\mathrm{M}`: Mechanical exergy
+        - :math:`e^\mathrm{PH}`: Physical exergy
+    """
+
+    def __init__(self, **kwargs):
+        r"""Initialize compressor component with given parameters."""
+        super().__init__(**kwargs)
+        self.P = None
+        self.Z_costs = kwargs.get("Z_costs", 0.0)  # Investment cost rate in currency/h
+
+    def calc_exergy_balance(self, T0: float, p0: float, split_physical_exergy) -> None:
+        r"""
+        Calculate the exergy balance of the compressor.
+
+        Performs exergy balance calculations considering the temperature relationships
+        between inlet stream, outlet stream, and ambient conditions.
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature in :math:`\mathrm{K}`.
+        p0 : float
+            Ambient pressure in :math:`\mathrm{Pa}`.
+        split_physical_exergy : bool
+            Flag indicating whether physical exergy is split into thermal and mechanical components.
+
+        """
+        # Get power flow
+        if (
+            1 in self.inl
+            and self.inl[1] is not None
+            and self.inl[1].get("kind") == "power"
+            and "energy_flow" in self.inl[1]
+        ):
+            self.P = self.inl[1]["energy_flow"]
+        else:
+            self.P = self.outl[0]["m"] * (self.outl[0]["h"] - self.inl[0]["h"])
+
+        # First, check for the invalid case: outlet temperature smaller than inlet temperature.
+        if self.inl[0]["T"] > self.outl[0]["T"]:
+            logger.warning(
+                f"Exergy balance of compressor '{self.name}' where outlet temperature ({self.outl[0]['T']}) "
+                f"is smaller than inlet temperature ({self.inl[0]['T']}) is not implemented."
+            )
+            self.E_P = np.nan
+            self.E_F = np.nan
+
+        # Case 1: Both temperatures at or above ambient
+        elif round(self.inl[0]["T"], 5) >= T0 and round(self.outl[0]["T"], 5) >= T0:
+            self.E_P = self.outl[0]["m"] * (self.outl[0]["e_PH"] - self.inl[0]["e_PH"])
+            self.E_F = abs(self.P)
+
+        # Case 2: Inlet below, outlet above ambient
+        elif round(self.inl[0]["T"], 5) < T0 and round(self.outl[0]["T"], 5) > T0:
+            if split_physical_exergy:
+                self.E_P = self.outl[0]["m"] * self.outl[0]["e_T"] + self.outl[0]["m"] * (
+                    self.outl[0]["e_M"] - self.inl[0]["e_M"]
+                )
+                self.E_F = abs(self.P) + self.inl[0]["m"] * self.inl[0]["e_T"]
+            else:
+                logger.warning(
+                    "While dealing with compressor below ambient, "
+                    "physical exergy should be split into thermal and mechanical components!"
+                )
+                self.E_P = self.outl[0]["m"] * (self.outl[0]["e_PH"] - self.inl[0]["e_PH"])
+                self.E_F = abs(self.P)
+
+        # Case 3: Both temperatures below ambient
+        elif round(self.inl[0]["T"], 5) < T0 and round(self.outl[0]["T"], 5) <= T0:
+            if split_physical_exergy:
+                self.E_P = self.outl[0]["m"] * (self.outl[0]["e_M"] - self.inl[0]["e_M"])
+                self.E_F = abs(self.P) + self.inl[0]["m"] * (self.inl[0]["e_T"] - self.outl[0]["e_T"])
+            else:
+                logger.warning(
+                    "While dealing with compressor below ambient, "
+                    "physical exergy should be split into thermal and mechanical components!"
+                )
+                self.E_P = self.outl[0]["m"] * (self.outl[0]["e_PH"] - self.inl[0]["e_PH"])
+                self.E_F = abs(self.P)
+
+        # Invalid case: outlet temperature smaller than inlet
+        else:
+            logger.warning(
+                f"Exergy balance of compressor '{self.name}' where outlet temperature is smaller "
+                "than inlet temperature is not implemented."
+            )
+            self.E_P = np.nan
+            self.E_F = np.nan
+
+        # Calculate exergy destruction and efficiency
+        self.E_D = self.E_F - self.E_P
+        if np.isnan(self.E_F):
+            # No fuel and product defined: the destruction is still the exergy balance.
+            self.E_D = abs(self.P) + self.inl[0]["m"] * self.inl[0]["e_PH"] - self.outl[0]["m"] * self.outl[0]["e_PH"]
+        self.epsilon = self.calc_epsilon()
+
+        # Log the results
+        logger.info(
+            f"Exergy balance of Compressor {self.name} calculated: "
+            f"E_P={self.E_P:.2f} W, E_F={self.E_F:.2f} W, E_D={self.E_D:.2f} W, "
+            f"Efficiency={self.epsilon:.2%}"
+        )
+
+    def aux_eqs(self, A, b, counter, T0, equations, chemical_exergy_enabled, split_physical_exergy=True):
+        r"""
+        Auxiliary equations for the compressor.
+
+        The power driving the compressor is its fuel and what the stream gains is its product. With
+        chemical exergy enabled the composition does not change, so its specific cost passes through
+        unchanged (F-principle), whether or not the physical exergy is split:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{CH}_\mathrm{in}}{\dot{E}^\mathrm{CH}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{CH}_\mathrm{out}}{\dot{E}^\mathrm{CH}_\mathrm{out}}
+
+        **Without split physical exergy** no further equation is written. The stream carries a single
+        cost variable for its physical exergy, that variable is the only one the component produces,
+        and the cost balance alone determines it:
+
+        .. math::
+
+            \dot{C}^\mathrm{PH}_\mathrm{out}
+            = \dot{C}^\mathrm{PH}_\mathrm{in} + \dot{C}^\mathrm{TOT}_\mathrm{power} + \dot{Z}
+
+        **With split physical exergy** the outlet carries two cost variables, so one equation is
+        needed, and which one depends on where the stream sits relative to the ambient temperature.
+
+        Both streams above :math:`T_0`: the thermal and the mechanical exergy are both gained, so
+        both are part of the product and are priced alike (P-principle):
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{T}_\mathrm{out} - \dot{C}^\mathrm{T}_\mathrm{in}}
+                 {\dot{E}^\mathrm{T}_\mathrm{out} - \dot{E}^\mathrm{T}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{M}_\mathrm{out} - \dot{C}^\mathrm{M}_\mathrm{in}}
+                   {\dot{E}^\mathrm{M}_\mathrm{out} - \dot{E}^\mathrm{M}_\mathrm{in}}
+
+        Inlet at or below and outlet above :math:`T_0`: the outlet carries thermal exergy that the
+        inlet did not have, so the whole of it is product:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{T}_\mathrm{out}}{\dot{E}^\mathrm{T}_\mathrm{out}}
+            = \frac{\dot{C}^\mathrm{M}_\mathrm{out} - \dot{C}^\mathrm{M}_\mathrm{in}}
+                   {\dot{E}^\mathrm{M}_\mathrm{out} - \dot{E}^\mathrm{M}_\mathrm{in}}
+
+        Both streams at or below :math:`T_0`: the cold exergy of the stream is consumed, so it is
+        fuel and follows the F-principle:
+
+        .. math::
+
+            \frac{\dot{C}^\mathrm{T}_\mathrm{in}}{\dot{E}^\mathrm{T}_\mathrm{in}}
+            = \frac{\dot{C}^\mathrm{T}_\mathrm{out}}{\dot{E}^\mathrm{T}_\mathrm{out}}
+
+        A share the stream does not gain passes through at its own specific cost instead, and a share
+        the outlet does not carry has no cost, :math:`\dot{C}^{x}_\mathrm{out} = 0`.
+
+        Below the ambient temperature the split is what separates the cold exergy from the pressure
+        rise, so running without it there makes the component warn.
+
+        Parameters
+        ----------
+        A : numpy.ndarray
+            The current cost matrix.
+        b : numpy.ndarray
+            The current right-hand-side vector.
+        counter : int
+            The current row index in the matrix.
+        T0 : float
+            Ambient temperature.
+        equations : list or dict
+            Data structure for storing equation labels.
+        chemical_exergy_enabled : bool
+            Flag indicating whether chemical exergy auxiliary equations should be added.
+        split_physical_exergy : bool, optional
+            If True, the physical exergy of a material stream is split into a thermal and a
+            mechanical share, each with its own cost variable. If False, the stream carries a
+            single cost variable for its physical exergy. Default is True.
+
+        Returns
+        -------
+        A : numpy.ndarray
+            The updated cost matrix.
+        b : numpy.ndarray
+            The updated right-hand-side vector.
+        counter : int
+            The updated row index (increased by 2 if chemical exergy is enabled, or by 1 otherwise).
+        equations : list or dict
+            Updated structure with equation labels.
+        """
+        # --- Chemical equality equation (row added only if enabled) ---
+        if chemical_exergy_enabled:
+            # Set the chemical cost equality:
+            set_equal_specific_cost(A, counter, self.inl[0], self.outl[0], "CH")
+            equations[counter] = {
+                "kind": "aux_equality",
+                "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                "property": "c_CH",
+            }
+            chem_row = 1
+        else:
+            chem_row = 0
+
+        # Without the split, the cost balance alone determines the cost of the physical exergy of the
+        # outlet, so no thermal/mechanical rule is needed.
+        if split_physical_exergy:
+            # --- Thermal/Mechanical cost equation ---
+            # Compute differences in thermal and mechanical exergy:
+            dET = self.outl[0]["E_T"] - self.inl[0]["E_T"]
+            dEM = self.outl[0]["E_M"] - self.inl[0]["E_M"]
+
+            # The row for the thermal/mechanical equation:
+            row_index = counter + chem_row
+            if self.inl[0]["T"] > T0 and self.outl[0]["T"] > T0:
+                if dET != 0 and dEM != 0:
+                    A[row_index, self.inl[0]["CostVar_index"]["T"]] = -1 / dET
+                    A[row_index, self.outl[0]["CostVar_index"]["T"]] = 1 / dET
+                    A[row_index, self.inl[0]["CostVar_index"]["M"]] = 1 / dEM
+                    A[row_index, self.outl[0]["CostVar_index"]["M"]] = -1 / dEM
+                    equations[row_index] = {
+                        "kind": "aux_p_rule",
+                        "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                        "property": "c_T, c_M",
+                    }
+                else:
+                    label = "T" if dET == 0 else "M"
+                    set_equal_specific_cost(A, row_index, self.inl[0], self.outl[0], label)
+                    equations[row_index] = {
+                        "kind": "aux_f_rule",
+                        "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                        "property": f"c_{label}",
+                    }
+            elif self.inl[0]["T"] <= T0 and self.outl[0]["T"] > T0:
+                # Case 2: Inlet at/below ambient, outlet above ambient
+                # Handle potential zero values for robustness
+                if self.outl[0]["E_T"] != 0 and dEM != 0:
+                    A[row_index, self.outl[0]["CostVar_index"]["T"]] = 1 / self.outl[0]["E_T"]
+                    A[row_index, self.inl[0]["CostVar_index"]["M"]] = 1 / dEM
+                    A[row_index, self.outl[0]["CostVar_index"]["M"]] = -1 / dEM
+                    equations[row_index] = {
+                        "kind": "aux_p_rule",
+                        "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                        "property": "c_T, c_M",
+                    }
+                else:
+                    label = "M" if self.outl[0]["E_T"] != 0 else "T"
+                    set_equal_specific_cost(A, row_index, self.inl[0], self.outl[0], label)
+                    equations[row_index] = {
+                        "kind": "aux_f_rule",
+                        "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                        "property": f"c_{label}",
+                    }
+            else:
+                # Case 3: Both temperatures at or below ambient - apply F-rule for thermal exergy
+                set_equal_specific_cost(A, row_index, self.inl[0], self.outl[0], "T")
+                equations[row_index] = {
+                    "kind": "aux_f_rule",
+                    "objects": [self.name, self.inl[0]["name"], self.outl[0]["name"]],
+                    "property": "c_T",
+                }
+
+            # Set the right-hand side entry for the thermal/mechanical row to zero.
+            b[row_index] = 0
+
+        # Update the counter accordingly.
+        new_counter = counter + (1 if split_physical_exergy else 0) + (1 if chemical_exergy_enabled else 0)
+
+        return A, b, new_counter, equations
+
+    def exergoeconomic_balance(self, T0, chemical_exergy_enabled=False, split_physical_exergy=True):
+        r"""
+        Perform exergoeconomic cost balance for the compressor.
+
+        The general exergoeconomic balance equation is:
+
+        .. math::
+            \dot{C}^{\mathrm{T}}_{\mathrm{in}}
+            + \dot{C}^{\mathrm{M}}_{\mathrm{in}}
+            - \dot{C}^{\mathrm{T}}_{\mathrm{out}}
+            - \dot{C}^{\mathrm{M}}_{\mathrm{out}}
+            + \dot{Z}
+            = 0
+
+        In case the chemical exergy of the streams is known:
+
+        .. math::
+            \dot{C}^{\mathrm{CH}}_{\mathrm{in}} =
+            \dot{C}^{\mathrm{CH}}_{\mathrm{out}}
+
+        This method computes cost rates for product and fuel, and derives
+        exergoeconomic indicators. The compressor consumes power (fuel) to increase
+        the exergy of the working fluid (product).
+
+        **Case 1: Both inlet and outlet above ambient temperature**
+
+        Both inlet and outlet satisfy :math:`T \geq T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \dot{C}^{\mathrm{PH}}_{\mathrm{out}}
+            - \dot{C}^{\mathrm{PH}}_{\mathrm{in}}
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{TOT}}_{\mathrm{power,in}}
+
+        **Case 2: Inlet at or below and outlet above ambient temperature**
+
+        Inlet satisfies :math:`T \leq T_0` and outlet :math:`T > T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \dot{C}^{\mathrm{T}}_{\mathrm{out}}
+            + \bigl(\dot{C}^{\mathrm{M}}_{\mathrm{out}}
+            - \dot{C}^{\mathrm{M}}_{\mathrm{in}}\bigr)
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{TOT}}_{\mathrm{power,in}}
+            + \dot{C}^{\mathrm{T}}_{\mathrm{in}}
+
+        **Case 3: Both inlet and outlet at or below ambient temperature**
+
+        Both inlet and outlet satisfy :math:`T \leq T_0`:
+
+        .. math::
+            \dot{C}_{\mathrm{P}}
+            = \dot{C}^{\mathrm{M}}_{\mathrm{out}}
+            - \dot{C}^{\mathrm{M}}_{\mathrm{in}}
+
+        .. math::
+            \dot{C}_{\mathrm{F}}
+            = \dot{C}^{\mathrm{TOT}}_{\mathrm{power,in}}
+            + \bigl(\dot{C}^{\mathrm{T}}_{\mathrm{in}}
+            - \dot{C}^{\mathrm{T}}_{\mathrm{out}}\bigr)
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature (K).
+        chemical_exergy_enabled : bool, optional
+            If True, chemical exergy is considered in the calculations.
+            Default is False.
+        split_physical_exergy : bool, optional
+            If True, the physical exergy of a material stream is split into a thermal and a
+            mechanical share, each with its own cost variable. If False, the stream carries a
+            single cost variable for its physical exergy. Default is True.
+
+        Attributes Set
+        --------------
+        C_P : float
+            Cost rate of product (currency/time).
+        C_F : float
+            Cost rate of fuel (currency/time).
+        c_P : float
+            Specific cost of product (currency/energy).
+        c_F : float
+            Specific cost of fuel (currency/energy).
+        C_D : float
+            Cost rate of exergy destruction (currency/time).
+        r : float
+            Relative cost difference (dimensionless).
+        f : float
+            Exergoeconomic factor (dimensionless).
+
+        Raises
+        ------
+        ValueError
+            If no inlet power stream is found.
+        """
+        # Retrieve the cost of power from the inlet stream of kind "power"
+        power_cost = None
+        for stream in self.inl.values():
+            if stream.get("kind") == "power":
+                power_cost = stream.get("C_TOT")
+                break
+        if power_cost is None:
+            logger.error("No inlet power stream found to determine power cost (C_TOT).")
+            raise ValueError("No inlet power stream found for exergoeconomic_balance.")
+
+        # Compute product and fuel costs depending on inlet/outlet temperatures relative to T0.
+        # Without the split the product is the rise of the physical exergy in every temperature case.
+        if not split_physical_exergy or (self.inl[0]["T"] >= T0 and self.outl[0]["T"] >= T0):
+            self.C_P = self.outl[0]["C_PH"] - self.inl[0]["C_PH"]
+            self.C_F = power_cost
+        elif self.inl[0]["T"] <= T0 and self.outl[0]["T"] > T0:
+            self.C_P = self.outl[0]["C_T"] + (self.outl[0]["C_M"] - self.inl[0]["C_M"])
+            self.C_F = power_cost + self.inl[0]["C_T"]
+        elif self.inl[0]["T"] <= T0 and self.outl[0]["T"] <= T0:
+            self.C_P = self.outl[0]["C_M"] - self.inl[0]["C_M"]
+            self.C_F = power_cost + (self.inl[0]["C_T"] - self.outl[0]["C_T"])
+        else:
+            # Outlet colder than the inlet across the ambient temperature: no fuel and product.
+            self.C_P = np.nan
+            self.C_F = np.nan
+
+        self.c_F = self.C_F / self.E_F if self.E_F else np.nan
+        self.c_P = self.C_P / self.E_P if self.E_P else np.nan
+        self.C_D = self.c_F * self.E_D
+        self.r = (self.c_P - self.c_F) / self.c_F if self.c_F else np.nan
+        self.f = self.Z_costs / (self.Z_costs + self.C_D) if (self.Z_costs + self.C_D) else np.nan

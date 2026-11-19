@@ -1,0 +1,42 @@
+--- exerpy-0.2.2/functions.py
++++ exerpy-0.2.2/functions.py
+@@ -2,7 +2,6 @@
+ import math
+ import os
+ 
+-import CoolProp.CoolProp as CP
+ 
+ from exerpy import __datapath__
+ from exerpy.logger import logger
+@@ -31,6 +30,7 @@
+     ValueError
+         If CoolProp has no molar mass for a species with a nonzero mass fraction.
+     """
++    import CoolProp.CoolProp as CP  # optional property path; not used for native Aspen data
+     species = {comp: fraction for comp, fraction in mass_fractions.items() if fraction}
+ 
+     if not species:
+@@ -74,6 +74,7 @@
+     Returns:
+     - mass_fractions: Dictionary with component names as keys and mass fractions as values.
+     """
++    import CoolProp.CoolProp as CP  # optional property path; not used for native Aspen data
+     molar_masses = {}
+     mass_fractions = {}
+ 
+@@ -106,6 +107,7 @@
+ 
+ def _library_entry(substance, chem_ex_data):
+     """Return the entry of a substance in the chemical exergy library, or None if it has no value."""
++    import CoolProp.CoolProp as CP  # optional property path; not used for native Aspen data
+     try:
+         aliases = CP.get_aliases(substance)
+     except ValueError:
+@@ -156,6 +158,7 @@
+     ValueError
+         If the library has no value for a substance of a mixture.
+     """
++    import CoolProp.CoolProp as CP  # optional property path; not used for native Aspen data
+     logger.info(f"Calculating the chemical exergy of {stream_data} at Tamb={Tamb} K and pamb={pamb} Pa")
+ 
+     try:

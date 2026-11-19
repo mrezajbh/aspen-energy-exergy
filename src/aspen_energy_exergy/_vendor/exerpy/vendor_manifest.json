@@ -1,0 +1,18 @@
+{
+  "package": "exerpy",
+  "version": "0.2.2",
+  "license": "MIT",
+  "wheel_sha256": "6778995899c4dffaf0ad32f446d833cc590c9a81f64fa69c0b6315cdbfe0a32c",
+  "source_url": "https://files.pythonhosted.org/packages/84/01/6526ad8b0ed7c8c1b7de48180e4af46ec764927b8c1d93b43841ca87a987/exerpy-0.2.2-py3-none-any.whl",
+  "changed_files": {
+    "functions.py": {
+      "upstream_sha256": "e14ddb76c1f2aa3e2c3b692f2c3626b739be92a8e14be1f5aa48c70bb7cc72d5",
+      "patched_sha256": "d75bf276a32925e63ddb44d150a4822fcc7b566207d323d1ce9e3bc64704bb0d"
+    }
+  },
+  "reason": "Move optional CoolProp imports into unused chemical-property helper functions. No numerical balance algorithms changed.",
+  "official_repository": "https://github.com/oemof/exerpy",
+  "official_docs": "https://exerpy.readthedocs.io/",
+  "unchanged_python_modules": 54,
+  "all_numerical_code_ast_unchanged": true
+}

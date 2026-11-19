@@ -1,0 +1,320 @@
+# -*- coding: utf-8
+
+"""Module for Units class.
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location tespy/tools/units.py
+
+SPDX-License-Identifier: MIT
+"""
+import shutil
+import sys
+import warnings
+
+import pint
+import platformdirs
+
+from tespy import __datapath__
+
+_SI_DEFAULTS = {
+    "temperature": "kelvin",
+    "temperature_difference": "delta_degC",
+    "enthalpy": "J/kg",
+    "specific_energy": "J/kg",
+    "entropy": "J/kg/K",
+    "pressure": "Pa",
+    "pressure_difference": "Pa",
+    "mass_flow": "kg/s",
+    "volumetric_flow": "m3/s",
+    "specific_volume": "m3/kg",
+    "volume": "m3",
+    "power": "W",
+    "heat": "W",
+    "quality": "1",
+    "vapor_mass_fraction": "1",  # backwards compatibility network import
+    "efficiency": "1",
+    "ratio": "1",
+    "length": "m",
+    "speed": "m/s",
+    "area": "m2",
+    "thermal_conductivity": "W/m/K",
+    "heat_transfer_coefficient": "W/K",
+    "heat_transfer_coefficient_per_area": "W/m**2/K",
+    "thermal_resistance": "K/W",
+    "angle": "degree",  # the SI unit for angle would be radians, but that would break things in the compressor
+    "frequency": "1/s",
+    # None is the default if not quantity is supplied
+    None: "1"
+}
+
+
+def _expand_unit_shorthands(string):
+    # defining e.g. "m3" as a unit makes pint prefix the alias as a whole,
+    # i.e. "cm3" would be 0.01 m**3
+    return (
+        string.replace("m3", "m**3")
+        .replace("m2", "m**2")
+        .replace("kgK", "(kg*K)")
+    )
+
+
+def _add_preprocessor(ureg):
+    if _expand_unit_shorthands not in ureg.preprocessors:
+        ureg.preprocessors.append(_expand_unit_shorthands)
+
+
+def _create_registry():
+    # necessary, because pint cannot auto detect environment changes and
+    # pint version changes
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    path = platformdirs.user_cache_dir(
+        "tespy", False, f"py{major}{minor}pint{pint.__version__}"
+    )
+    try:
+        ureg = pint.UnitRegistry(cache_folder=path)
+    except FileNotFoundError:
+        # this is necessary, because inside the cache folder, pint points
+        # to the pint installation inside (any) of the venvs (potentially
+        # the first ever created?). If that venv moves or gets deleted,
+        # then the link cannot be found any more and we have to recreated
+        # the cache
+        shutil.rmtree(path)
+        ureg = pint.UnitRegistry(cache_folder=path)
+    _add_preprocessor(ureg)
+    return ureg
+
+
+_VALIDATION_REGISTRY = None
+_COMPATIBILITY = {}
+
+
+def is_compatible(quantity, unit):
+    """Check a unit string against the dimension of a quantity.
+
+    A parse only registry is created on first use: the check needs no
+    network, e.g. for units read from a file. Units the registry does not
+    know are not rejected, their conversion fails on the unit system of the
+    network instead.
+    """
+    global _VALIDATION_REGISTRY
+    key = (quantity, str(unit))
+    try:
+        return _COMPATIBILITY[key]
+    except KeyError:
+        pass
+    if _VALIDATION_REGISTRY is None:
+        _VALIDATION_REGISTRY = _create_registry()
+    try:
+        compatible = _is_compatible(_VALIDATION_REGISTRY, quantity, key[1])
+    except pint.errors.UndefinedUnitError:
+        compatible = True
+    _COMPATIBILITY[key] = compatible
+    return compatible
+
+
+def _is_compatible(ureg, quantity, unit):
+    if quantity == "temperature_difference" and not unit.startswith("delta_"):
+        _units = ureg._units
+        kelvin = list(_units["K"].aliases) + [_units["K"].name]
+        rankine = list(_units["rankine"].aliases) + [_units["rankine"].name]
+        return unit in kelvin or unit in rankine
+    return (
+        ureg.Quantity(1, unit).dimensionality
+        == ureg.Quantity(1, SI_UNITS[quantity]).dimensionality
+    )
+
+
+class Units:
+
+    @classmethod
+    def from_json(cls, default_units):
+        instance = cls()
+        instance.set_defaults(**default_units)
+        return instance
+
+    def __init__(self):
+        self.default = dict(_SI_DEFAULTS)
+        self._conversions_applied = False
+        self._ureg = _create_registry()
+        self._conversions = {}
+        self._parsed_units = {}
+        self._canonical = {}
+
+    def parsed_unit(self, unit):
+        """Return the pint Unit for a unit string.
+
+        The units are parsed once and then cached.
+        """
+        try:
+            return self._parsed_units[unit]
+        except KeyError:
+            parsed = self.ureg.Unit(unit)
+            self._parsed_units[unit] = parsed
+            return parsed
+
+    def canonical(self, unit):
+        """Return the canonical name of a unit string, e.g. degC becomes
+        degree_Celsius. The names are parsed once and then cached."""
+        try:
+            return self._canonical[unit]
+        except KeyError:
+            canonical = str(self.parsed_unit(unit))
+            self._canonical[unit] = canonical
+            return canonical
+
+    def convert(self, value, from_unit, to_unit):
+        """Convert a magnitude from one unit to another.
+
+        Unit conversions are affine, so factor and offset are computed once
+        per unit pair and cached, bypassing the pint conversion machinery
+        for every subsequent value. The cache is keyed by the unit strings,
+        pint objects of any registry are accepted.
+        """
+        from_unit = str(from_unit)
+        to_unit = str(to_unit)
+        try:
+            factor, offset = self._conversions[(from_unit, to_unit)]
+        except KeyError:
+            offset = self.ureg.Quantity(0.0, from_unit).m_as(to_unit)
+            # probe at a large power of two: the division is exact and the
+            # cancellation error of the offset subtraction becomes negligible
+            probe = 2.0 ** 20
+            factor = (
+                self.ureg.Quantity(probe, from_unit).m_as(to_unit) - offset
+            ) / probe
+            self._conversions[(from_unit, to_unit)] = (factor, offset)
+        return value * factor + offset
+
+    def value_from_SI(self, value_SI, base_unit, target_unit):
+        """Convert a value in SI units to its magnitude in the target unit."""
+        return self.convert(value_SI, base_unit, target_unit)
+
+    def value_to_SI(self, value, unit, quantity):
+        """Convert a magnitude in the given unit to the SI unit of the
+        quantity."""
+        return self.convert(value, unit, SI_UNITS[quantity])
+
+    def quantity_from_SI(self, value_SI, base_unit, target_unit):
+        return self.ureg.Quantity(
+            self.value_from_SI(value_SI, base_unit, target_unit), target_unit
+        )
+
+    def set_defaults(self, **kwargs):
+        """Set the default units
+
+        Parameters
+        ----------
+        temperature : str
+            Default unit: "kelvin"
+        temperature_difference : str
+            Default unit: "delta_degC"
+        enthalpy : str
+            Default unit: "J/kg"
+        specific_energy : str
+            Default unit: "J/kg"
+        entropy : str
+            Default unit: "J/kg/K"
+        pressure : str
+            Default unit: "Pa". For backwards compatibility, setting this also
+            sets :code:`pressure_difference` to the same unit unless
+            :code:`pressure_difference` is explicitly provided as well.
+        pressure_difference : str
+            Default unit: "Pa"
+        mass_flow : str
+            Default unit: "kg/s"
+        volumetric_flow : str
+            Default unit: "m3/s"
+        specific_volume : str
+            Default unit: "m3/kg"
+        volume : str
+            Default unit: "m3"
+        power : str
+            Default unit: "W"
+        heat : str
+            Default unit: "W"
+        quality : str
+            Default unit: "1"
+        efficiency : str
+            Default unit: "1"
+        ratio : str
+            Default unit: "1"
+        length : str
+            Default unit: "m"
+        speed : str
+            Default unit: "m/s"
+        area : str
+            Default unit: "m2"
+        thermal_conductivity : str
+            Default unit: "W/m/K"
+        heat_transfer_coefficient : str
+            Default unit: "W/K"
+        heat_transfer_coefficient_per_area : str
+            Default unit: "W/m**2/K"
+        thermal_resistance : str
+            Default unit: "K/W"
+        """
+        if self._conversions_applied:
+            msg = (
+                "You are changing default units after a solve has already "
+                "been executed. Values specified and results keep their SI "
+                "value and are displayed in the new default units from the "
+                "next solve on. New plain number specifications use the new "
+                "default units. Values specified as pint quantities keep the "
+                "custom unit."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
+        for key, value in kwargs.items():
+            self._check_quantity_exists(key)
+            if value == "-":
+                value = "1"
+            if self._is_compatible(key, value):
+                self.default[key] = value
+            else:
+                msg = f"Unit {value} is not compatible with quantity {key}"
+                raise ValueError(msg)
+
+    def _is_compatible(self, quantity, unit):
+        return _is_compatible(self.ureg, quantity, unit)
+
+    def get_default(self, quantity):
+        self._check_quantity_exists(quantity)
+        return self.default[quantity]
+
+    def _check_quantity_exists(self, quantity):
+        if quantity not in self.default:
+            msg = (
+                f"The quantity {quantity} is unknown. Please specify any of "
+                f"the following: "
+                f"{', '.join([key for key in self.default if key is not None])}."
+            )
+            raise KeyError(msg)
+
+
+    def set_ureg(self, ureg):
+        """Replace default ureg with a custom one
+
+        Parameters
+        ----------
+        ureg : pint.UnitRegistry
+            Change the pint.UnitRegistry to a custom one
+        """
+        self._ureg = ureg
+        _add_preprocessor(ureg)
+        # cached objects belong to the replaced registry
+        self._conversions = {}
+        self._parsed_units = {}
+        self._canonical = {}
+
+    def get_ureg(self):
+        return self._ureg
+
+    def _serialize(self):
+        return {k: v for k, v in self.default.items() if k is not None}
+
+    ureg = property(get_ureg, set_ureg)
+
+
+SI_UNITS = dict(_SI_DEFAULTS)

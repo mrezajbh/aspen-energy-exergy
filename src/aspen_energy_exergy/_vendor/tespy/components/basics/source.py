@@ -1,0 +1,89 @@
+# -*- coding: utf-8
+
+"""Module for class Source.
+
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location tespy/components/basics/source.py
+
+SPDX-License-Identifier: MIT
+"""
+
+import numpy as np
+
+from tespy.components.component import Component
+from tespy.components.component import component_registry
+
+
+@component_registry
+class Source(Component):
+    r"""
+    A flow originates from a Source.
+
+    Ports
+    -----
+
+    - Fluid outlets: out1
+
+    Mandatory Equations
+    -------------------
+
+    None
+
+    Parameters
+    ----------
+
+    char_warnings : bool
+        Ignore warnings on default characteristics usage for this component.
+
+    design : list
+        List containing design parameters (stated as String).
+
+    design_path : str
+        Path to the components design case.
+
+    label : str
+        The label of the component.
+
+    local_design : bool
+        Treat this component in design mode in an offdesign calculation.
+
+    local_offdesign : bool
+        Treat this component in offdesign mode in a design calculation.
+
+    offdesign : list
+        List containing offdesign parameters (stated as String).
+
+    printout : bool
+        Include this component in the network's results printout.
+
+    Example
+    -------
+    Create a source and specify a label.
+
+    >>> from tespy.components import Source
+    >>> so = Source('a labeled source')
+    >>> so.label
+    'a labeled source'
+    """
+
+    _is_wrapper_branch_source = True
+
+    @staticmethod
+    def outlets():
+        return ['out1']
+
+    @staticmethod
+    def get_mandatory_constraints():
+        return {}
+
+    def start_fluid_wrapper_branch(self):
+        outconn = self.outl[0]
+        branch = {
+            "connections": [outconn],
+            "components": [self]
+        }
+        outconn.target.propagate_wrapper_to_target(branch)
+
+        return {outconn.label: branch}

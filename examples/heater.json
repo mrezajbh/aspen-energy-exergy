@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "source_filename": "Illustrative hydrogen heater, ideal gas at constant heat capacity",
+    "enthalpy_entropy_basis": "aspen_formation"
+  },
+  "components": [
+    {"id": "H2", "name": "hydrogen", "cas": "1333-74-0", "atoms": {"H": 2}, "type": "conventional"}
+  ],
+  "streams": [
+    {
+      "id": "FEED", "from_block": null, "to_block": "HEATER",
+      "temperature_k": 298.15, "pressure_pa": 101325, "mass_kg_h": 2.01588, "molar_kmol_h": 1,
+      "enthalpy_kw": 0, "entropy_kw_k": 0, "component_flows_kmol_h": {"H2": 1},
+      "property_method": "IDEAL", "vapor_fraction": 1
+    },
+    {
+      "id": "PRODUCT", "from_block": "HEATER", "to_block": null,
+      "temperature_k": 398.15, "pressure_pa": 101325, "mass_kg_h": 2.01588, "molar_kmol_h": 1,
+      "enthalpy_kw": 0.8, "entropy_kw_k": 0.0023138568250747125, "component_flows_kmol_h": {"H2": 1},
+      "property_method": "IDEAL", "vapor_fraction": 1
+    }
+  ],
+  "blocks": [
+    {
+      "id": "HEATER", "type": "HEATER", "inlets": ["FEED"], "outlets": ["PRODUCT"],
+      "transfers": [{"id": "steam", "kind": "heat", "rate_kw": 0.8, "temperature_k": 420,
+                     "basis": "Illustrative isothermal steam utility"}]
+    }
+  ]
+}

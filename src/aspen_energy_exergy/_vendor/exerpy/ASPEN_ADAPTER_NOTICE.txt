@@ -1,0 +1,34 @@
+EXERPY 0.2.2 VENDORED FOR ASPEN-STATE ANALYSIS
+
+Upstream: https://github.com/oemof/exerpy
+Release: https://pypi.org/project/exerpy/0.2.2/
+Documentation: https://exerpy.readthedocs.io/
+License: MIT; see LICENSE.
+
+Upstream metadata declares CoolProp as a dependency. This project does not
+install that dependency. All state properties and exergy splits used by this
+adapter are provided by Aspen exports or the explicitly documented elemental
+reference reconstruction.
+
+One narrow modification is recorded in coolprop_lazy_import.patch:
+functions.py imports CoolProp only inside the composition and chemical-property
+helpers that require it. The Aspen-state adapter does not call those helpers.
+No mock/stub CoolProp module is provided and no property values are fabricated.
+The numerical AST is unchanged after removing import nodes; the other 54 Python
+modules are byte-identical to the pinned upstream wheel. See vendor_manifest.json.
+
+Active upstream calculations
+- functions.add_total_exergy_flow recomputes material exergy rates when both
+  physical and chemical specific exergies are supplied.
+- ExergyAnalysis.analyse recomputes complete control-volume exergy balances from
+  material and heat/work boundary connections. These intentionally contain no
+  fictitious internal component models; their component-sum warnings are saved.
+- Applicable native equipment calc_exergy_balance methods are checked separately.
+  Missing splits, unsupported classes and differing native boundary conventions
+  are explicit and are not described as fully validated equipment models.
+
+Imported total-only stream values remain total-only; they are never relabelled
+physical exergy or assigned zero chemical exergy merely to satisfy an interface.
+Imported heat exergy retains the project's documented heat-boundary assumptions.
+The comparison checks balance arithmetic and native equipment definitions with
+shared input properties. It is not an independent validation of those properties.

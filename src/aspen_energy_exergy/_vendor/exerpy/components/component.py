@@ -1,0 +1,256 @@
+import msgspec
+import numpy as np
+
+from exerpy.quantities import Name
+
+
+def component_registry(cls):
+    """
+    A decorator function to register components in the component registry.
+    Registers the class using the class's name as the key.
+    """
+    component_registry.items[cls.__name__] = cls
+    return cls
+
+
+# Initialize the registry to store components
+component_registry.items = {}
+
+
+@component_registry
+class Component:
+    r"""
+    Base class for all ExerPy components.
+
+    This class serves as the parent class for all exergy analysis components. It provides
+    the basic structure and methods for exergy analysis calculations including the
+    calculation of exergetic efficiency and exergy balance.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Arbitrary keyword arguments that will be assigned as attributes to the component.
+
+    Attributes
+    ----------
+    E_F : float
+        Exergy fuel of the component :math:`\dot{E}_\mathrm{F}` in :math:`\mathrm{W}`.
+    E_P : float
+        Exergy product of the component :math:`\dot{E}_\mathrm{P}` in :math:`\mathrm{W}`.
+    E_D : float
+        Exergy destruction of the component :math:`\dot{E}_\mathrm{D}` in :math:`\mathrm{W}`.
+    epsilon : float
+        Exergetic efficiency of the component :math:`\varepsilon` in :math:`-`.
+
+    Notes
+    -----
+    The exergetic efficiency is calculated as the ratio of exergy product to
+    exergy fuel:
+
+    .. math::
+
+        \varepsilon = \frac{\dot{E}_\mathrm{P}}{\dot{E}_\mathrm{F}}
+
+    The exergy balance for any component follows the principle:
+
+    .. math::
+
+        \dot{E}_\mathrm{F} = \dot{E}_\mathrm{P} + \dot{E}_\mathrm{D}
+
+
+    See Also
+    --------
+    exerpy.components : Module containing all available components for exergy analysis
+    """
+
+    class Input(msgspec.Struct, kw_only=True):
+        """Keys of the component's entry in the input that ExerPy reads.
+
+        A subclass that reads further keys extends its parent's ``Input``. The keys
+        not declared here are still passed on, but not validated.
+        """
+
+        name: Name
+
+    def __init__(self, **kwargs):
+        r"""Initialize the component with given parameters."""
+        self.__dict__.update(kwargs)
+
+    def calc_exergy_balance(self, T0: float, p0: float) -> None:
+        r"""
+        Calculate the exergy balance of the component.
+
+        This method should be implemented by child classes to perform specific
+        exergy balance calculations.
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature in :math:`\mathrm{K}`.
+        p0 : float
+            Ambient pressure in :math:`\mathrm{Pa}`.
+        """
+        pass
+
+    def calc_epsilon(self):
+        r"""
+        Calculate the exergetic efficiency of the component.
+
+        The exergetic efficiency is defined as the ratio of exergy product to
+        exergy fuel. If the exergy fuel is zero, the function returns NaN to
+        avoid division by zero.
+
+        Returns
+        -------
+        float or nan
+            Exergetic efficiency :math:`\varepsilon = \frac{\dot{E}_\mathrm{P}}{\dot{E}_\mathrm{F}}`
+            or NaN if :math:`\dot{E}_\mathrm{F} = 0`.
+
+        Notes
+        -----
+        .. math::
+            \varepsilon = \begin{cases}
+            \frac{\dot{E}_\mathrm{P}}{\dot{E}_\mathrm{F}} & \mathrm{if } \dot{E}_\mathrm{F} \neq 0\\
+            \mathrm{NaN} & \mathrm{if } \dot{E}_\mathrm{F} = 0
+            \end{cases}
+        """
+        if self.E_F == 0:
+            return np.nan
+        else:
+            return self.E_P / self.E_F
+
+    def exergoeconomic_balance(self, T0, chemical_exergy_enabled=False, split_physical_exergy=True):
+        r"""
+        Cost balance of a component.
+
+        This method is intentionally empty in the base class. Every component overrides it and
+        defines its own cost of fuel :math:`\dot{C}_\mathrm{F}` and cost of product
+        :math:`\dot{C}_\mathrm{P}`, following the fuel and the product of its exergy balance. What
+        is derived from the two is the same for every component:
+
+        .. math::
+
+            c_\mathrm{F} = \frac{\dot{C}_\mathrm{F}}{\dot{E}_\mathrm{F}}
+            \qquad
+            c_\mathrm{P} = \frac{\dot{C}_\mathrm{P}}{\dot{E}_\mathrm{P}}
+
+        The cost of the exergy destroyed is what the destroyed exergy would have cost as fuel. It is
+        not part of the cost balance, which is why it shows up nowhere in the cost matrix:
+
+        .. math::
+
+            \dot{C}_\mathrm{D} = c_\mathrm{F} \cdot \dot{E}_\mathrm{D}
+
+        The relative cost difference says by how much a unit of exergy becomes more expensive
+        passing through the component, and the exergoeconomic factor says how much of the cost the
+        component causes is investment rather than inefficiency:
+
+        .. math::
+
+            r = \frac{c_\mathrm{P} - c_\mathrm{F}}{c_\mathrm{F}}
+            \qquad
+            f = \frac{\dot{Z}}{\dot{Z} + \dot{C}_\mathrm{D}}
+
+        with :math:`\dot{Z}` the investment and operating cost of the component :cite:`Bejan1996`. The
+        share of the cost of the dissipative components charged to the component,
+        :math:`\dot{Z}_\mathrm{diss}`, is part of its cost balance and thus of :math:`c_\mathrm{P}` and
+        :math:`r` :cite:`lazzaretto2006speco`, but not of :math:`f`: it is neither the investment of the
+        component nor the cost of its exergy destruction.
+
+        The docstring of each component states only its own
+        :math:`\dot{C}_\mathrm{F}` and :math:`\dot{C}_\mathrm{P}`; the five definitions above are
+        not repeated there.
+
+        Parameters
+        ----------
+        T0 : float
+            Ambient temperature in :math:`\mathrm{K}`.
+        chemical_exergy_enabled : bool, optional
+            If True, chemical exergy is considered in the calculations.
+        split_physical_exergy : bool, optional
+            If True, the physical exergy of a material stream is split into a thermal and a
+            mechanical share, each with its own cost variable. If False, the stream carries a
+            single cost variable for its physical exergy. Default is True.
+        """
+        return
+
+
+def set_equal_specific_cost(A, row, ref, out, label, ref_is_outlet=False):
+    r"""
+    Write the row that gives two streams the same specific cost of one exergy share :math:`x`.
+
+    .. math::
+
+        \frac{\dot{C}^{x}_\mathrm{ref}}{\dot{E}^{x}_\mathrm{ref}}
+        = \frac{\dot{C}^{x}_\mathrm{out}}{\dot{E}^{x}_\mathrm{out}}
+
+    A stream without exergy of the share carries no cost of it, :math:`\dot{C}^{x} = c^{x}
+    \dot{E}^{x} = 0` :cite:`lazzaretto2006speco`. If either stream has none, the row becomes
+    :math:`\dot{C}^{x}_\mathrm{out} = 0`, or :math:`\dot{C}^{x}_\mathrm{ref} = 0` if ``ref`` is an
+    outlet as well and the one without exergy. An inlet is never fixed, its cost is set upstream.
+
+    Parameters
+    ----------
+    A : numpy.ndarray
+        Cost matrix, changed in place.
+    row : int
+        Index of the row to write.
+    ref : dict
+        Reference stream, an inlet or an outlet of the component.
+    out : dict
+        Outlet priced against ``ref``.
+    label : str
+        Cost variable: ``"T"``, ``"M"``, ``"PH"``, ``"CH"``, or ``"exergy"`` for power and heat.
+    ref_is_outlet : bool, optional
+        True if ``ref`` is an outlet of the component too (P-principle). Default is False.
+    """
+    key = "E" if label == "exergy" else f"E_{label}"
+    if ref[key] != 0 and out[key] != 0:
+        A[row, ref["CostVar_index"][label]] = 1 / ref[key]
+        A[row, out["CostVar_index"][label]] = -1 / out[key]
+    elif ref_is_outlet and out[key] != 0:
+        A[row, ref["CostVar_index"][label]] = 1
+    else:
+        A[row, out["CostVar_index"][label]] = 1
+
+
+def set_mixing_cost(A, row, inlets, out, label, weights=None):
+    r"""
+    Write the row that gives the outlet of a mixing node the mass-weighted specific cost of its inlets.
+
+    .. math::
+
+        \frac{\dot{C}^{x}_\mathrm{out}}{\dot{E}^{x}_\mathrm{out}}
+        = \sum_{i} \frac{n_{i} \, \dot{m}_{i}}{\sum_{k} n_{k} \, \dot{m}_{k}}
+        \cdot \frac{\dot{C}^{x}_{i}}{\dot{E}^{x}_{i}}
+
+    :math:`n_{i}` is how often inlet :math:`i` exists, e.g. the number of parallel branches it
+    stands for. An inlet without exergy of the share :math:`x` adds nothing. An outlet without it
+    carries no cost of it, and the row becomes :math:`\dot{C}^{x}_\mathrm{out} = 0`.
+
+    Parameters
+    ----------
+    A : numpy.ndarray
+        Cost matrix, changed in place.
+    row : int
+        Index of the row to write.
+    inlets : iterable of dict
+        Inlet streams of the node.
+    out : dict
+        Outlet stream of the node.
+    label : str
+        Cost variable, e.g. ``"M"`` or ``"CH"``.
+    weights : iterable of float, optional
+        How often each inlet exists, :math:`n_{i}`, in the order of ``inlets``. Default is 1 each.
+    """
+    key = f"E_{label}"
+    if out[key] == 0:
+        A[row, out["CostVar_index"][label]] = 1
+        return
+    inlets = list(inlets)
+    weights = [1] * len(inlets) if weights is None else list(weights)
+    m_out = sum(n * inlet["m"] for inlet, n in zip(inlets, weights, strict=True))
+    A[row, out["CostVar_index"][label]] = -1 / out[key]
+    for inlet, n in zip(inlets, weights, strict=True):
+        if inlet[key] != 0:
+            A[row, inlet["CostVar_index"][label]] = n * inlet["m"] / (m_out * inlet[key])

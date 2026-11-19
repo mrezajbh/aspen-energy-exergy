@@ -1,0 +1,454 @@
+{
+  "name": "Biogas to Jetfuel - FT | saved November case and declared utility boundaries",
+  "backup_sha256": "4e16eb57942f8db308ee6ac44863b7301eeaa60704b3ce2cea2809a40fc45fc2",
+  "product_streams": [
+    "JETFUEL",
+    "NAPHTHA",
+    "LPG"
+  ],
+  "fuel_feeds": [
+    "BIOGAS",
+    "C-FEED",
+    "H2-HDS",
+    "H2-HCK"
+  ],
+  "utility_pairs": [
+    [
+      "LPS",
+      "LPC"
+    ]
+  ],
+  "transfers": [
+    {
+      "block": "BIO-CLCK",
+      "id": "duty",
+      "temperature_k": 292.153331647073,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "ACT-CRB",
+      "id": "duty",
+      "temperature_k": 292.153331647073,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "ZNO",
+      "id": "duty",
+      "temperature_k": 522.561374957027,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "CU-ZNO",
+      "id": "duty",
+      "temperature_k": 317.504108012026,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "K-101A",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "K-101B",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "MEMB-1",
+      "id": "duty",
+      "temperature_k": 307.948283278565,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "MEMB-2",
+      "id": "duty",
+      "temperature_k": 307.843688377106,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "MEMB-3",
+      "id": "duty",
+      "temperature_k": 307.948283278565,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "TURB-01",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "K-702",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "CO2-ST",
+      "id": "duty",
+      "temperature_k": 248.060839529012,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "AM-CPR1",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "COND+DH",
+      "id": "duty",
+      "temperature_k": 311.666019325937,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "P-201",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "COOLER",
+      "id": "duty",
+      "temperature_range_k": [313.269388122564, 298.15],
+      "basis": "Saved Aspen duty with uniform dQ/dT over the saved inlet and outlet temperature interval"
+    },
+    {
+      "block": "KO-301",
+      "id": "duty",
+      "temperature_k": 313.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "SEP-301",
+      "id": "duty",
+      "temperature_k": 313.149999999621,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "K-301",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "CONC-H",
+      "id": "duty",
+      "temperature_k": 591.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "MEMBRANE",
+      "id": "duty",
+      "temperature_k": 315.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "K-401",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "HOT-SEP",
+      "id": "duty",
+      "temperature_k": 493.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "R-FT",
+      "id": "COOL-ST",
+      "temperature_k": 416.79256180857,
+      "basis": "Shared steam outlet temperature proxy"
+    },
+    {
+      "block": "K-500",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "LOWP",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "COLD-SEP",
+      "id": "duty",
+      "temperature_k": 298.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "HRU",
+      "id": "duty",
+      "temperature_k": 308.15,
+      "basis": "Full heat use at uniform 35 C delivery, an assumed receiving boundary"
+    },
+    {
+      "block": "BOOSTER",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "ISOMERIZ",
+      "id": "duty",
+      "temperature_k": 573.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "VES",
+      "id": "duty",
+      "temperature_k": 303.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "HYDRTRT2",
+      "id": "duty",
+      "temperature_k": 613.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "HP-SEP2",
+      "id": "duty",
+      "temperature_k": 313.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "T-601",
+      "id": "condenser",
+      "temperature_k": 278.15,
+      "basis": "Saved column process temperature"
+    },
+    {
+      "block": "T-601",
+      "id": "reboiler",
+      "temperature_k": 502.714873,
+      "basis": "Saved column process temperature"
+    },
+    {
+      "block": "LOSS",
+      "id": "E-LOSS",
+      "temperature_k": 3773.15,
+      "basis": "Flue gas outlet temperature proxy"
+    },
+    {
+      "block": "FLASH",
+      "id": "duty",
+      "temperature_k": 303.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "H-REC-HX",
+      "id": "QQ",
+      "temperature_k": 533.7021027258676,
+      "basis": "Shared donor heat duty divided by saved material entropy change"
+    },
+    {
+      "block": "HX-REC-H",
+      "id": "QQ",
+      "temperature_k": 533.7021027258676,
+      "basis": "Shared donor heat duty divided by saved material entropy change"
+    },
+    {
+      "block": "CO2-COMP",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "DRYER",
+      "id": "duty",
+      "temperature_k": 303.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "H-101",
+      "id": "duty",
+      "temperature_k": 523.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "K-102",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "AM-CPR2",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "K-802",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "P-601",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "P-602",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "ST-TURB",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "1ST-P",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "COOL-TOW",
+      "id": "duty",
+      "temperature_k": 303.15,
+      "basis": "Uniform process outlet temperature proxy"
+    },
+    {
+      "block": "WAT-P-B",
+      "id": "drive_loss",
+      "temperature_k": 298.15,
+      "basis": "Drive heat loss at the assumed 25 C environment"
+    },
+    {
+      "block": "COIL-WOU",
+      "id": "COOL-ST",
+      "temperature_k": 416.79256180857,
+      "basis": "Shared steam outlet temperature proxy"
+    },
+    {
+      "block": "PAR-A",
+      "id": "HV-POW-A",
+      "kind": "work",
+      "basis": "Electrical work deposited in the plasma reactor"
+    },
+    {
+      "block": "R-401",
+      "id": "HV-POWER",
+      "kind": "work",
+      "basis": "Electrical work deposited in the plasma reactor"
+    }
+  ],
+  "groups": {
+    "guard_beds": [
+      "BIO-CLCK",
+      "ACT-CRB",
+      "E-101",
+      "H-101",
+      "HDS-COMO",
+      "ZNO",
+      "CU-ZNO"
+    ],
+    "biogas_membranes": [
+      "K-101A",
+      "MIX-1",
+      "K-101B",
+      "DH-HX",
+      "HX-01",
+      "MEMB-1",
+      "MEMB-2",
+      "MEMB-3",
+      "K-102",
+      "MIX-REC",
+      "SEP-ST",
+      "CO2-SPLT"
+    ],
+    "psa": [
+      "KO-301",
+      "SEP-301",
+      "SP-301",
+      "K-301",
+      "K-802",
+      "LOWP",
+      "DH-HX4",
+      "SEP-W"
+    ],
+    "co_membrane": [
+      "K-401",
+      "DH-HX3",
+      "MEMBRANE"
+    ],
+    "dryer": [
+      "HX-13",
+      "FLASH",
+      "DRYER"
+    ],
+    "ft_heat_recovery": [
+      "HRU",
+      "COLD-SEP"
+    ],
+    "all_membranes": [
+      "K-101A",
+      "MIX-1",
+      "K-101B",
+      "DH-HX",
+      "HX-01",
+      "MEMB-1",
+      "MEMB-2",
+      "MEMB-3",
+      "K-102",
+      "MIX-REC",
+      "SEP-ST",
+      "CO2-SPLT",
+      "K-401",
+      "DH-HX3",
+      "MEMBRANE"
+    ],
+    "selected_packages": [
+      "BIO-CLCK",
+      "ACT-CRB",
+      "E-101",
+      "H-101",
+      "HDS-COMO",
+      "ZNO",
+      "CU-ZNO",
+      "K-101A",
+      "MIX-1",
+      "K-101B",
+      "DH-HX",
+      "HX-01",
+      "MEMB-1",
+      "MEMB-2",
+      "MEMB-3",
+      "K-102",
+      "MIX-REC",
+      "SEP-ST",
+      "CO2-SPLT",
+      "KO-301",
+      "SEP-301",
+      "SP-301",
+      "K-301",
+      "K-802",
+      "LOWP",
+      "DH-HX4",
+      "SEP-W",
+      "K-401",
+      "DH-HX3",
+      "MEMBRANE",
+      "HX-13",
+      "FLASH",
+      "DRYER",
+      "HRU",
+      "COLD-SEP"
+    ],
+    "cooler_water_section": [
+      "CONCEPTH",
+      "COOLER"
+    ]
+  }
+}

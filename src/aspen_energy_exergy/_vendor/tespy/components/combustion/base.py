@@ -1,0 +1,1104 @@
+# -*- coding: utf-8
+
+"""Module of class CombustionChamber.
+
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location
+tespy/components/combustion/base.py
+
+SPDX-License-Identifier: MIT
+"""
+from tespy.components.component import Component
+from tespy.components.component import component_registry
+from tespy.tools import logger
+from tespy.tools.data_containers import ComponentParameter
+from tespy.tools.data_containers import MandatoryConstraint
+from tespy.tools.fluid_properties import h_mix_pT
+from tespy.tools.fluid_properties import s_mix_pT
+from tespy.tools.fluid_properties.helpers import fluid_structure
+from tespy.tools.fluid_properties.wrappers import CoolPropWrapper
+from tespy.tools.global_vars import COMBUSTION_FLUIDS
+from tespy.tools.global_vars import ERR
+from tespy.tools.global_vars import FLUID_ALIASES
+from tespy.tools.helpers import TESPyComponentError
+from tespy.tools.helpers import fluidalias_in_list
+
+
+@component_registry
+class CombustionChamber(Component):
+    r"""
+    The class CombustionChamber is parent class of all combustion components.
+
+    .. image:: /api/_images/components/CombustionChamber.svg
+       :alt: flowsheet of the combustionchamber
+       :align: center
+       :class: only-light
+
+    .. image:: /api/_images/components/CombustionChamber_darkmode.svg
+       :alt: flowsheet of the combustionchamber
+       :align: center
+       :class: only-dark
+
+    Ports
+    -----
+
+    - Fluid inlets: in1, in2
+    - Fluid outlets: out1 (flue gas)
+
+    Mandatory Equations
+    -------------------
+
+    - mass flow balance over all inflows and outflows: :py:meth:`mass_flow_func <tespy.components.combustion.base.CombustionChamber.mass_flow_func>`
+    - pressure equality constraints: :py:meth:`combustion_pressure_structure_matrix <tespy.components.combustion.base.CombustionChamber.combustion_pressure_structure_matrix>`
+    - constraints for stoichiometry of the reaction: :py:meth:`stoichiometry_func <tespy.components.combustion.base.CombustionChamber.stoichiometry_func>`
+    - constraint for energy balance: :py:meth:`energy_balance_func <tespy.components.combustion.base.CombustionChamber.energy_balance_func>`
+
+    Parameters
+    ----------
+
+    char_warnings : bool
+        Ignore warnings on default characteristics usage for this component.
+
+    design : list
+        List containing design parameters (stated as String).
+
+    design_path : str
+        Path to the components design case.
+
+    f_nox : float, dict
+        Mass-based nitric oxide (NO) generation rate in flue gas in mass of
+        created NO per mass of fuel and air input. Only active if value is
+        explicitly set. Quantity: :code:`ratio`.
+
+    label : str
+        The label of the component.
+
+    lamb : float, dict
+        Available oxygen to stoichiometric oxygen ratio. Quantity:
+        :code:`ratio`.
+        Equation: :py:meth:`lambda_func <tespy.components.combustion.base.CombustionChamber.lambda_func>`.
+
+    local_design : bool
+        Treat this component in design mode in an offdesign calculation.
+
+    local_offdesign : bool
+        Treat this component in offdesign mode in a design calculation.
+
+    offdesign : list
+        List containing offdesign parameters (stated as String).
+
+    printout : bool
+        Include this component in the network's results printout.
+
+    ti : float, dict
+        Thermal input of fuel: lower heating value multiplied with mass flow.
+        Quantity: :code:`heat`.
+        Equation: :py:meth:`ti_func <tespy.components.combustion.base.CombustionChamber.ti_func>`.
+
+    Notes
+    -----
+
+    .. tip::
+
+        You can add more fluids by importing :code:`COMBUSTION_FLUIDS` from
+        the :code:`tespy.tools` module and passing the respective information.
+        See in the example below, how to do that. To retrieve the fluids
+        available by default run:
+
+        .. code-block:: python
+
+            from tespy.tools.global_vars import COMBUSTION_FLUIDS
+            COMBUSTION_FLUIDS.fluids.keys()
+
+    .. note::
+
+        The fuel and the air components can be connected to either of the
+        inlets.
+
+    Example
+    -------
+    The combustion chamber calculates energy input due to combustion as well as
+    the flue gas composition based on the type of fuel and the amount of
+    oxygen supplied. In this example a mixture of methane, hydrogen and
+    carbon dioxide is used as fuel.
+
+    >>> from tespy.components import Sink, Source, CombustionChamber
+    >>> from tespy.connections import Connection
+    >>> from tespy.networks import Network
+    >>> from tespy.tools.fluid_properties import T_sat_p
+    >>> nw = Network(iterinfo=False)
+    >>> nw.units.set_defaults(**{
+    ...     "pressure": "bar", "pressure_difference": "bar",
+    ...     "temperature": "degC"
+    ... })
+    >>> amb = Source("ambient air")
+    >>> sf = Source("fuel")
+    >>> fg = Sink("flue gas outlet")
+    >>> comb = CombustionChamber("combustion chamber")
+    >>> amb_comb = Connection(amb, "out1", comb, "in1")
+    >>> sf_comb = Connection(sf, "out1", comb, "in2")
+    >>> comb_fg = Connection(comb, "out1", fg, "in1")
+    >>> nw.add_conns(sf_comb, amb_comb, comb_fg)
+
+    Specify the thermal input of the combustion chamber. At the given fluid
+    compositions this determines the mass flow of the fuel. The outlet
+    temperature of the flue gas determines the ratio of oxygen to fuel mass
+    flow.
+
+    >>> comb.set_attr(ti=500000)
+    >>> amb_comb.set_attr(
+    ...     p=1, T=20,
+    ...     fluid={"Ar": 0.0129, "N2": 0.7553, "CO2": 0.0004, "O2": 0.2314}
+    ... )
+    >>> sf_comb.set_attr(T=25, fluid={"CO2": 0.03, "H2": 0.01, "CH4": 0.96})
+    >>> comb_fg.set_attr(T=1200)
+    >>> nw.solve("design")
+    >>> round(comb.lamb.val, 3)
+    2.014
+    >>> comb.set_attr(lamb=2)
+    >>> comb_fg.set_attr(T=None)
+    >>> nw.solve("design")
+    >>> round(comb_fg.T.val, 1)
+    1206.6
+
+    You can add a custom combustion fluid if you need. The combustion gas must
+    be available in fluid property back-end and you need to provide the name of
+    the fluid as well as its formation enthalpy :code:`hf` **in kJ/mol** or the
+    lower heating value :code:`LHV` in **J/kg**. For example, let's use
+    :code:`ethanol` and :code:`acetone` as examples:
+
+    >>> from tespy.tools import COMBUSTION_FLUIDS
+    >>> COMBUSTION_FLUIDS.add_fluid("ethanol", hf=-234.95)
+    >>> COMBUSTION_FLUIDS.add_fluid("acetone", LHV=28.603e6)
+
+    >>> sf_comb.set_attr(fluid={"acetone": 1})
+    >>> nw.solve("design")
+    >>> round(comb_fg.T.val, 1)
+    1232.3
+    >>> sf_comb.set_attr(fluid={"ethanol": 1})
+    >>> nw.solve("design")
+    >>> round(comb_fg.T.val, 1)
+    1241.7
+    """
+
+    def get_parameters(self):
+        return {
+            "lamb": ComponentParameter(
+                min_val=1,
+                func=self.lambda_func,
+                dependents=self.lambda_dependents,
+                num_eq_sets=1,
+                quantity="ratio",
+                description="available oxygen to stoichiometric oxygen ratio",
+                calc=self._calc_lambda
+            ),
+            "ti": ComponentParameter(
+                min_val=0,
+                func=self.ti_func,
+                dependents=self.ti_dependents,
+                num_eq_sets=1,
+                quantity="heat",
+                description="thermal input of fuel: lower heating value multiplied with mass flow",
+                calc=self._calc_ti
+            ),
+            "f_nox": ComponentParameter(
+                quantity="ratio",
+                min_val=0,
+                max_val=1,
+                description="Mass-based nitric oxide (NO) generation rate in flue gas in mass of created NO per mass of fuel and air input. Only active if value is explicitly set"
+            ),
+        }
+
+    def _update_num_eq(self):
+        inl, outl = self._get_combustion_connections()
+        fluid_eqs = set([f for c in inl + outl for f in c.fluid.val])
+        self.fluid_eqs_list = list(fluid_eqs)
+        self.constraints["stoichiometry_constraints"].num_eq = len(self.fluid_eqs_list)
+
+    def get_mandatory_constraints(self):
+        return {
+            "mass_flow_constraints": MandatoryConstraint(**{
+                "func": self.mass_flow_func,
+                "dependents": self.mass_flow_dependents,
+                "num_eq_sets": 1,
+                "description": "mass flow balance over all inflows and outflows"
+            }),
+            "reactor_pressure_constraints": MandatoryConstraint(**{
+                "structure_matrix": self.combustion_pressure_structure_matrix,
+                "num_eq_sets": 2,
+                "description": "pressure equality constraints"
+            }),
+            "stoichiometry_constraints": MandatoryConstraint(**{
+                "func": self.stoichiometry_func,
+                "dependents": self.stoichiometry_dependents,
+                "num_eq_sets": 1,
+                "elements": ["f_nox"],
+                "description": "constraints for stoichiometry of the reaction"
+            }),
+            "energy_balance_constraints": MandatoryConstraint(**{
+                "func": self.energy_balance_func,
+                "dependents": self.energy_balance_dependents,
+                "num_eq_sets": 1,
+                "description": "constraint for energy balance"
+            })
+        }
+
+    @staticmethod
+    def inlets():
+        return ["in1", "in2"]
+
+    @staticmethod
+    def outlets():
+        return ["out1"]
+
+    @staticmethod
+    def port_descriptions():
+        return {
+            "out1": "flue gas",
+        }
+
+    def propagate_wrapper_to_target(self, branch):
+        if self in branch["components"]:
+            return
+
+        outconn = self.outl[0]
+        branch["connections"] += [outconn]
+        branch["components"] += [self]
+        outconn.target.propagate_wrapper_to_target(branch)
+
+    def _preprocess(self, num_nw_vars):
+        super()._preprocess(num_nw_vars)
+        self.setup_reaction_parameters()
+
+        # impose better starting values if None are available
+        if self.outl[0].fluid.val0 == {}:
+            for f in self.fuel_list:
+                self.outl[0].fluid.val0[f] = 0
+
+    def _get_combustion_connections(self):
+        return (self.inl[:2], [self.outl[0]])
+
+    def setup_reaction_parameters(self):
+        r"""Setup parameters for reaction (gas name aliases and LHV)."""
+        self.fuel_list = []
+        all_fluids = {
+            f: c.fluid.engine[f]
+            for c in self.inl + self.outl for f in c.fluid.val
+        }
+        for f in all_fluids.keys():
+            if issubclass(all_fluids[f], CoolPropWrapper) or all_fluids[f] is None:
+                if fluidalias_in_list(f, COMBUSTION_FLUIDS.fluids.keys()):
+                    self.fuel_list += [f]
+            else:
+                if f in COMBUSTION_FLUIDS.fluids.keys():
+                    self.fuel_list += [f]
+        self.fuel_list = set(self.fuel_list)
+
+        if len(self.fuel_list) == 0:
+            msg = (
+                "Your network's fluids do not contain any fuels, that are "
+                f"available for the component {self.label} of type "
+                f"{self.__class__.__name__}. Available fuels are: "
+                f"{', '.join(COMBUSTION_FLUIDS.fluids.keys())}."
+            )
+            logger.error(msg)
+            raise TESPyComponentError(msg)
+
+        else:
+            msg = (
+                f"The fuels for component {self.label} of type "
+                f"{self.__class__.__name__} are: {', '.join(self.fuel_list)}."
+            )
+            logger.debug(msg)
+
+        self.no = None
+        other_fluids = ["O2", "CO2", "H2O", "N2"]
+        if self.f_nox.is_set:
+            other_fluids += ["NO"]
+
+        for fluid in other_fluids:
+            if not fluidalias_in_list(fluid, all_fluids):
+                aliases = ", ".join(FLUID_ALIASES.get_fluid(fluid))
+                msg = (
+                    f"The component {self.label} (class "
+                    f"{self.__class__.__name__}) requires that the fluid "
+                    f"{fluid} (aliases: {aliases}) is in list of fluids "
+                    "associated with adjacent connections."
+                )
+                logger.error(msg)
+                raise TESPyComponentError(msg)
+            else:
+                setattr(self, fluid.lower(), fluid)
+
+        self.fuels = {}
+        for f in self.fuel_list:
+            self.fuels[f] = {}
+            structure = fluid_structure(f)
+            for el in ["C", "H", "O"]:
+                if el in structure:
+                    self.fuels[f][el] = structure[el]
+                else:
+                    self.fuels[f][el] = 0
+            if f not in COMBUSTION_FLUIDS.fluids.keys():
+                self.fuels[f]["LHV"] = self.calc_lhv(f)
+                continue
+
+            if COMBUSTION_FLUIDS.fluids[f]["LHV"] is None:
+                self.fuels[f]["LHV"] = self.calc_lhv(f)
+                continue
+
+            self.fuels[f]["LHV"] = COMBUSTION_FLUIDS.fluids[f]["LHV"]
+
+    def calc_lhv(self, f):
+        r"""
+        Calculate the lower heating value of the combustion chamber's fuel.
+
+        - Source for fluids O2, H2O and CO2: :cite:`CODATA1989`
+        - Source for all other fluids: :cite:`CRCHandbook2021`
+
+        Parameters
+        ----------
+        f : str
+            Alias of the fuel.
+
+        Returns
+        -------
+        val : float
+            Lower heating value of the combustion chambers fuel.
+
+            .. math::
+
+                LHV = -\frac{\sum_i {\Delta H_f^0}_i -
+                \sum_j {\Delta H_f^0}_j }
+                {M_{fuel}}\\
+                \forall i \in \text{reation products},\\
+                \forall j \in \text{reation educts},\\
+                \Delta H_f^0: \text{molar formation enthalpy}
+        """
+        inl, _ = self._get_combustion_connections()
+        hf = {}
+
+        hf[self.o2] = 0
+        hf[self.co2] = -393.51
+        # water (gaseous)
+        hf[self.h2o] = -241.826
+
+        key = set(
+            list(COMBUSTION_FLUIDS.fluids.keys())
+        ).intersection(FLUID_ALIASES.get_fluid(f))
+
+        val = (
+            -(
+                self.fuels[f]["H"] / 2 * hf[self.h2o]
+                + self.fuels[f]["C"] * hf[self.co2]
+                - (
+                    (
+                        self.fuels[f]["C"] + self.fuels[f]["H"] / 4
+                        - self.fuels[f]["O"] / 2
+                    ) * hf[self.o2]
+                    + COMBUSTION_FLUIDS.fluids[list(key)[0]]["hf"]
+                )
+            ) / inl[0].fluid.wrapper[f]._molar_mass * 1000
+        )
+
+        return val
+
+    def _add_missing_fluids(self, connections):
+        inl, outl = self._get_combustion_connections()
+        if set(inl + outl) & set(connections):
+            if self.f_nox.is_set:
+                try:
+                    from tespy.tools.fluid_properties.wrappers import PyromatWrapper
+                except ModuleNotFoundError:
+                    msg = (
+                        f"Using f_nox to incorporate nitric oxide in the flue "
+                        f"gas of component {self.label} (class "
+                        f"{self.__class__.__name__}) currently only works "
+                        "pyromat as fluid property back end. Install it in "
+                        "your environment if you want to make use of the "
+                        "feature."
+                    )
+                    raise ModuleNotFoundError(msg)
+                if "NO" not in outl[0].fluid.engine:
+                    outl[0].fluid.engine["NO"] = PyromatWrapper
+                    outl[0].fluid.back_end["NO"] = "ig"
+                    outl[0].fluid.val["NO"] = 0.0001
+
+                return ["H2O", "CO2", "NO"]
+            else:
+                return ["H2O", "CO2"]
+        else:
+            return super()._add_missing_fluids(connections)
+
+    def mass_flow_func(self):
+        r"""
+        Calculate the residual value for component's mass flow balance.
+
+        Returns
+        -------
+        residual : list
+            Vector with residual value for component's mass flow balance.
+
+            .. math::
+
+                0 = \dot{m}_{in,1} + \dot{m}_{in,2} - \dot{m}_{out,1}
+        """
+        inl, outl = self._get_combustion_connections()
+        return inl[0].m.val_SI + inl[1].m.val_SI - outl[0].m.val_SI
+
+    def mass_flow_dependents(self):
+        inl, outl = self._get_combustion_connections()
+        return [[c.m for c in inl + outl]]
+
+    def combustion_pressure_structure_matrix(self, k):
+        r"""
+        Equations for reactor pressure balance.
+
+        Returns
+        -------
+        residual : list
+            Residual values of equations.
+
+            .. math::
+
+                0 = p_\text{in,1} - p_\text{out,1}\\
+                0 = p_\text{in,2} - p_\text{out,1}
+        """
+        inl, outl = self._get_combustion_connections()
+
+        self._structure_matrix[k, inl[0].p.sm_col] = 1
+        self._structure_matrix[k, outl[0].p.sm_col] = -1
+
+        self._structure_matrix[k + 1, inl[1].p.sm_col] = 1
+        self._structure_matrix[k + 1, outl[0].p.sm_col] = -1
+
+    def stoichiometry_func(self):
+        r"""
+        Calculate residual values for all fluids in stoichiometry.
+
+        Shared intermediate quantities (molar flows of fuel atoms, oxygen,
+        lambda, excess fuel) are computed once and reused for every fluid
+        equation, instead of being recomputed per fluid.
+
+        Returns
+        -------
+        residual : list
+            Vector with residual values of equations.
+
+            General equation for each fluid:
+
+            .. math::
+
+                res = \sum_i \left(x_{fluid,i} \cdot \dot{m}_{i}\right) -
+                \sum_j \left(x_{fluid,j} \cdot \dot{m}_{j}\right) + dm\\
+                \forall i \in \text{combustion inlets},\;
+                \forall j \in \text{flue gas outlet}
+
+            where :math:`dm` accounts for the production or consumption of
+            reactive species (see :py:meth:`stoichiometry
+            <tespy.components.combustion.base.CombustionChamber.stoichiometry>`
+            for the per-species expressions).
+        """
+        inl, outl = self._get_combustion_connections()
+
+        n_fuel = {}
+        n_oxy_stoich = {}
+        n_h = 0
+        n_c = 0
+        n_o = 0
+        for f in self.fuel_list:
+            n_fuel[f] = 0
+            for i in inl:
+                n = (
+                    i.m.val_SI * i.fluid.val.get(f, 0)
+                    / inl[0].fluid.wrapper[f]._molar_mass
+                )
+                n_fuel[f] += n
+                n_h += n * self.fuels[f]["H"]
+                n_c += n * self.fuels[f]["C"]
+                n_o += n * self.fuels[f]["O"]
+            n_oxy_stoich[f] = n_fuel[f] * (
+                self.fuels[f]["H"] / 4 + self.fuels[f]["C"] - self.fuels[f]["O"] / 2
+            )
+
+        n_oxygen_stoich = n_h / 4 + n_c - n_o / 2
+        n_oxygen = sum(
+            i.m.val_SI * i.fluid.val.get(self.o2, 0)
+            / inl[0].fluid.wrapper[self.o2]._molar_mass
+            for i in inl
+        )
+
+        if not self.lamb.is_set:
+            self.lamb.val_SI = n_oxygen / n_oxygen_stoich
+
+        if self.lamb.val_SI < 1:
+            n_h_exc = (n_oxygen_stoich - n_oxygen) * 4
+            n_c_exc = n_oxygen_stoich - n_oxygen
+        else:
+            n_h_exc = 0
+            n_c_exc = 0
+
+        M_no = (
+            inl[0].fluid.wrapper[self.n2]._molar_mass
+            + inl[0].fluid.wrapper[self.o2]._molar_mass
+        )
+        if self.f_nox.is_set:
+            n_nox_param = (inl[0].m.val_SI + inl[1].m.val_SI) * self.f_nox.val_SI / M_no
+        else:
+            n_nox_param = 0
+        n_nitrogen = sum(
+            i.m.val_SI * i.fluid.val.get(self.n2, 0)
+            / inl[0].fluid.wrapper[self.n2]._molar_mass
+            for i in inl
+        )
+
+        residual = []
+        for fluid in self.fluid_eqs_list:
+            if fluid == self.co2:
+                dm = (n_c - n_c_exc) * inl[0].fluid.wrapper[self.co2]._molar_mass
+            elif fluid == self.h2o:
+                dm = (n_h - n_h_exc) / 2 * inl[0].fluid.wrapper[self.h2o]._molar_mass
+            elif fluid == self.o2:
+                if self.lamb.val_SI < 1:
+                    dn = -n_oxygen
+                elif n_nitrogen >= n_nox_param * 0.5:
+                    dn = -(n_oxygen / self.lamb.val_SI - n_nox_param * 0.5)
+                else:
+                    dn = -(n_oxygen / self.lamb.val_SI - n_nitrogen)
+                dm = dn * inl[0].fluid.wrapper[self.o2]._molar_mass
+            elif fluid in self.fuel_list:
+                if self.lamb.val_SI < 1:
+                    n_fuel_exc = (
+                        -(n_oxygen / n_oxygen_stoich - 1) * n_oxy_stoich[fluid]
+                        / (
+                            self.fuels[fluid]["H"] / 4 + self.fuels[fluid]["C"]
+                            - self.fuels[fluid]["O"] / 2
+                        )
+                    )
+                else:
+                    n_fuel_exc = 0
+                dm = -(n_fuel[fluid] - n_fuel_exc) * inl[0].fluid.wrapper[fluid]._molar_mass
+            elif fluid == self.n2:
+                # TODO: take into account existing NO in inlets
+                if self.lamb.val_SI < 1:
+                    dn = 0
+                elif n_nitrogen >= n_nox_param * 0.5:
+                    dn = -(n_nox_param * 0.5)
+                else:
+                    dn = -n_nitrogen
+                dm = dn * inl[0].fluid.wrapper[self.n2]._molar_mass
+            elif fluid == self.no:
+                if self.lamb.val_SI < 1:
+                    dn = 0
+                elif n_nitrogen >= n_nox_param * 0.5:
+                    dn = n_nox_param
+                else:
+                    dn = n_nitrogen * 2
+                dm = dn * M_no / 2
+            else:
+                dm = 0
+
+            res = dm
+            for i in inl:
+                res += i.fluid.val.get(fluid, 0) * i.m.val_SI
+            res -= outl[0].fluid.val.get(fluid, 0) * outl[0].m.val_SI
+            residual.append(res)
+
+        return residual
+
+    def stoichiometry_dependents(self):
+        inl, outl = self._get_combustion_connections()
+        mass_flows = [c.m for c in inl + outl]
+        return {
+            "scalars": [
+                mass_flows for f in self.fluid_eqs_list
+            ],
+            "vectors": [
+                {c.fluid: c.fluid.is_var for c in inl}
+                | {outl[0].fluid: outl[0].fluid.is_var & {f}}
+                for f in self.fluid_eqs_list
+            ]
+        }
+
+    def energy_balance_func(self):
+        r"""
+        Calculate the energy balance of the adiabatic combustion chamber.
+
+        Returns
+        -------
+        residual : float
+            Residual value of equation.
+
+            .. math::
+
+                \begin{split}
+                0 = & \sum_i \dot{m}_{in,i} \cdot
+                \left( h_{in,i} - h_{in,i,ref} \right)\\
+                & -\dot{m}_{out,2}\cdot\left( h_{out,1}-h_{out,1,ref} \right)\\
+                & + LHV_{fuel} \cdot\left(\sum_i\dot{m}_{in,i}\cdot
+                x_{fuel,in,i}- \dot{m}_{out,1} \cdot x_{fuel} \right)
+                \end{split}\\
+
+                \forall i \in \text{inlets}
+
+        Note
+        ----
+        The temperature for the reference state is set to 25 °C, thus
+        the water may be liquid. In order to make sure, the state is
+        referring to the lower heating value, the state of the water in the
+        flue gas is forced to gaseous.
+
+        - Reference temperature: 298.15 K.
+        - Reference pressure: 1 bar.
+        """
+        #TODO substract energy for NO formation
+        inl, outl = self._get_combustion_connections()
+        T_ref = 298.15
+        p_ref = 1e5
+
+        res = 0
+        for i in inl:
+            res += i.m.val_SI * (
+                i.h.val_SI
+                - h_mix_pT(p_ref, T_ref, i.fluid_data, mixing_rule="forced-gas")
+            )
+
+        for o in outl:
+            res -= o.m.val_SI * (
+                o.h.val_SI
+                - h_mix_pT(p_ref, T_ref, o.fluid_data, mixing_rule="forced-gas")
+            )
+
+        res += self._calc_ti()
+        if self.f_nox.is_set:
+            # NO is endothermal reaction 90.3 kJ/mol
+            NO_in = sum(i.fluid.val.get(self.no, 0) * i.m.val_SI for i in inl)
+            o = self.outl[0]
+            NO_out = o.fluid.val.get(self.no, 0) * o.m.val_SI  # kg / s
+            res -= (
+                90.30 * 1e3 * (NO_out - NO_in)  # J/mol * kg/s
+                / o.fluid.wrapper[self.no]._molar_mass # kg / mol
+            )
+        return res
+
+    def energy_balance_dependents(self):
+        inl, outl = self._get_combustion_connections()
+        return {
+            "scalars": [var for c in inl + outl for var in [c.m, c.h]],
+            "vectors": [{
+                c.fluid: self.fuel_list & c.fluid.is_var for c in inl + outl
+            }]
+        }
+
+    def lambda_func(self):
+        r"""
+        Calculate the residual for specified lambda.
+
+        Returns
+        -------
+        residual : float
+            Residual value of equation.
+
+            .. math::
+
+                0 = \frac{\dot{m}_{f,m}}{\dot{m}_{O_2,m} \cdot
+                \left(n_{C,fuel} + 0.25 \cdot n_{H,fuel}\right)} - \lambda
+
+                \dot{m}_{fluid,m} = \sum_i \frac{x_{fluid,i} \cdot \dot{m}_{i}}
+                {M_{fluid}}\\ \forall i \in inlets
+        """
+        return self._calc_lambda() - self.lamb.val_SI
+
+    def lambda_dependents(self):
+        inl, _ = self._get_combustion_connections()
+        return {
+            "scalars": [c.m for c in inl],
+            "vectors": [{
+                c.fluid: (self.fuel_list | {self.o2}) & c.fluid.is_var
+                for c in inl
+            }]
+        }
+
+    def _calc_lambda(self):
+        r"""
+        Calculate oxygen to stoichiometric oxygen ratio
+
+        Returns
+        -------
+        lambda : float
+            Oxygen to stoichiometric oxygen ratio.
+
+            .. math::
+
+                \lambda = \frac{\dot{m}_{f,m}}{\dot{m}_{O_2,m} \cdot
+                \left(n_{C,fuel} + 0.25 \cdot n_{H,fuel}\right)}
+
+                \dot{m}_{fluid,m} = \sum_i \frac{x_{fluid,i} \cdot \dot{m}_{i}}
+                {M_{fluid}}\\ \forall i \in inlets
+        """
+        inl, _ = self._get_combustion_connections()
+
+        n_h = 0
+        n_c = 0
+        n_o = 0
+        for f in self.fuel_list:
+            for i in inl:
+                n_fuel = (
+                    i.m.val_SI * i.fluid.val.get(f, 0)
+                    / inl[0].fluid.wrapper[f]._molar_mass
+                )
+                n_h += n_fuel * self.fuels[f]["H"]
+                n_c += n_fuel * self.fuels[f]["C"]
+                n_o += n_fuel * self.fuels[f]["O"]
+
+        n_oxygen = 0
+        for i in inl:
+            n_oxygen += (
+                i.m.val_SI * i.fluid.val.get(self.o2, 0)
+                / inl[0].fluid.wrapper[self.o2]._molar_mass
+            )
+        n_oxygen_stoich = n_h / 4 + n_c - n_o / 2
+        return n_oxygen / n_oxygen_stoich
+
+    def ti_func(self):
+        r"""
+        Calculate the residual for specified thermal input.
+
+        Returns
+        -------
+        residual : float
+            Residual value of function.
+
+            .. math::
+
+                0 = \dot{m}_{fuel} \cdot LHV - ti
+        """
+        return self._calc_ti() - self.ti.val_SI
+
+    def ti_dependents(self):
+        inl, outl = self._get_combustion_connections()
+        return {
+            "scalars": [c.m for c in inl + outl],
+            "vectors": [{
+                c.fluid: self.fuel_list & c.fluid.is_var for c in inl + outl
+            }]
+        }
+
+    def _calc_ti(self):
+        r"""
+        Calculate the thermal input of the combustion chamber.
+
+        Returns
+        -------
+        ti : float
+            Thermal input.
+
+            .. math::
+
+                ti = LHV \cdot \left[\sum_i \left(\dot{m}_{in,i}
+                \cdot x_{fuel,in,i}
+                \right) - \dot{m}_{out,1} \cdot x_{fuel,out,1} \right]
+                \; \forall i \in [1,2]
+        """
+        inl, outl = self._get_combustion_connections()
+        ti = 0
+        for f in self.fuel_list:
+            m = 0
+            for i in inl:
+                m += i.m.val_SI * i.fluid.val.get(f, 0)
+
+            for o in outl:
+                m -= o.m.val_SI * o.fluid.val.get(f, 0)
+
+            ti += m * self.fuels[f]["LHV"]
+
+        return ti
+
+    def convergence_check(self):
+        r"""
+        Perform a convergence check.
+
+        Note
+        ----
+        Manipulate enthalpies/pressure at inlet and outlet if not specified
+        by user to match physically feasible constraints, keep fluid
+        composition within feasible range and then propagates it towards the
+        outlet.
+        """
+        # required to work with combustion chamber and engine
+        inl, outl = self._get_combustion_connections()
+
+        m = 0
+        for i in inl:
+            if i.m.val_SI < 0 and i.m.is_var:
+                i.m.set_reference_val_SI(0.01)
+            m += i.m.val_SI
+
+        ######################################################################
+        # check fluid composition
+        outl = outl[0]
+        for f in outl.fluid.is_var:
+            if f == self.o2:
+                if outl.fluid.val[f] > 0.25:
+                    outl.fluid._reference_container.val[f] = 0.2
+                if outl.fluid.val[f] < 0.001:
+                    outl.fluid._reference_container.val[f] = 0.05
+
+            elif f == self.co2:
+                if outl.fluid.val[f] > 0.15:
+                    outl.fluid._reference_container.val[f] = 0.1
+
+            elif f == self.h2o:
+                if outl.fluid.val[f] > 0.15:
+                    outl.fluid._reference_container.val[f] = 0.1
+
+            elif f in self.fuel_list:
+                if outl.fluid.val[f] > 0:
+                    outl.fluid._reference_container.val[f] = 0
+
+            else:
+                m_f = 0
+                for i in inl:
+                    m_f += i.fluid.val.get(f, 0) * i.m.val_SI
+
+                if abs(outl.fluid.val[f] - m_f / m) > 0.03:
+                    outl.fluid._reference_container.val[f] = m_f / m
+
+        total_mass_fractions = sum(outl.fluid.val.values())
+        for fluid in outl.fluid.is_var:
+            outl.fluid._reference_container.val[fluid] /= total_mass_fractions
+
+        if outl.m.val_SI < 0 and outl.m.is_var:
+            outl.m.set_reference_val_SI(10)
+
+        if not outl.good_starting_values and outl.h.is_var:
+            if outl.calc_T() < 800:
+                h = h_mix_pT(
+                    outl.p.val_SI, 800, outl.fluid_data, outl.mixing_rule
+                )
+                outl.h.set_reference_val_SI(h)
+            elif outl.calc_T() > 1500:
+                h = h_mix_pT(
+                    outl.p.val_SI, 1500, outl.fluid_data, outl.mixing_rule
+                )
+                outl.h.set_reference_val_SI(h)
+
+        ######################################################################
+        # additional checks for performance improvement
+        if not self.lamb.is_set and self.lamb.val_SI < 2 - ERR:
+            # rich mixtures stall the solver: redistribute the inlet flows
+            # so that lambda is 2 for the actual fuel's oxygen demand
+            self._set_inlet_flows_for_lambda(2)
+
+    def _oxygen_balance_per_kg(self, connection):
+        r"""
+        Oxygen supply and stoichiometric demand in mol/kg of an inlet fluid.
+
+        Returns :code:`(supply, demand)` or :code:`None` without molar masses.
+        """
+        inl, _ = self._get_combustion_connections()
+
+        def molar_mass(fluid):
+            for c in inl:
+                if fluid in c.fluid.wrapper:
+                    return c.fluid.wrapper[fluid]._molar_mass
+            return None
+
+        if molar_mass(self.o2) is None:
+            return None
+
+        supply = connection.fluid.val.get(self.o2, 0) / molar_mass(self.o2)
+        demand = 0
+        for f in self.fuel_list:
+            x = connection.fluid.val.get(f, 0)
+            if x > 0:
+                demand += x / molar_mass(f) * (
+                    self.fuels[f]["C"] + self.fuels[f]["H"] / 4
+                    - self.fuels[f]["O"] / 2
+                )
+        return supply, demand
+
+    def _set_inlet_flows_for_lambda(self, lamb):
+        r"""
+        Move the variable inlet mass flows to the air ratio lamb.
+
+        With :math:`c_i = s_i - \lambda \cdot d_i` (oxygen supply and demand
+        per kg, see :py:meth:`_oxygen_balance_per_kg`) the air ratio holds for
+        :math:`\sum_i \dot{m}_i \cdot c_i = 0`. Two variable flows are
+        redistributed at their current total, a single variable flow is
+        scaled to the fixed one. Nothing happens for inlets of the same sign
+        (premixed reactants) or with good starting values.
+        """
+        inl, _ = self._get_combustion_connections()
+        if any(i.good_starting_values for i in inl):
+            return
+        coefficients = []
+        for i in inl:
+            balance = self._oxygen_balance_per_kg(i)
+            if balance is None:
+                return
+            coefficients.append(balance[0] - lamb * balance[1])
+        if not min(coefficients) < 0 < max(coefficients):
+            return
+        (a, c_a), (b, c_b) = zip(inl, coefficients)
+        if a.m.is_var and b.m.is_var:
+            total = a.m.val_SI + b.m.val_SI
+            a.m.set_reference_val_SI(total * -c_b / (c_a - c_b))
+            b.m.set_reference_val_SI(total * c_a / (c_a - c_b))
+        elif a.m.is_var:
+            a.m.set_reference_val_SI(-b.m.val_SI * c_b / c_a)
+        elif b.m.is_var:
+            b.m.set_reference_val_SI(-a.m.val_SI * c_a / c_b)
+
+    def _initial_flow_relations(self):
+        # force a reasonable ratio between oxygen and fuel flow
+        inl, _ = self._get_combustion_connections()
+        lamb = self.lamb.val_SI if self.lamb.is_set else 2
+
+        relation = {}
+        for i in inl:
+            # available oxygen and demand for oxygen by fuel
+            balance = self._oxygen_balance_per_kg(i)
+            if balance is None:
+                return []
+            supply, demand = balance
+            relation[i.m] = supply - lamb * demand
+
+        coefficients = list(relation.values())
+        if min(coefficients) < 0 < max(coefficients):
+            return [relation]
+
+        # a single inlet carrying the premixed reactants leaves nothing
+        # to relate
+        return []
+
+    def _initial_affine_edges(self):
+        # the reaction enthalpy dominates the outlet enthalpy, only the
+        # pressure relations are usable guesses
+        connections = self.inl + self.outl
+        first = connections[0]
+        return [(first.p, c.p, 1.0, 0.0) for c in connections[1:]]
+
+    def initial_state(self, port):
+        if port == 'out1':
+            return {"phase": "gas", "T": 1200}
+        return {"phase": "gas", "T": 293.15}
+
+    @staticmethod
+    def initialise_source(c, key):
+        r"""
+        Return a generic pressure starting value at the outlet.
+
+        Only consulted as the last fallback tier when neither user
+        values, propagation nor the temperature field anchors covered
+        the pressure. Enthalpy starting values are generated by the
+        automatic starting value machinery instead.
+
+        Parameters
+        ----------
+        c : tespy.connections.connection.Connection
+            Connection to perform initialisation on.
+
+        key : str
+            Fluid property to retrieve.
+
+        Returns
+        -------
+        val : float
+            Starting value for pressure in SI units, 0 for no information.
+
+            .. math::
+
+                val = \begin{cases}
+                5 \cdot 10^5 & \text{key = 'p'}\\
+                10^6 & \text{key = 'h'}
+                \end{cases}
+        """
+        if key == "p":
+            return 5e5
+        return 0
+
+    @staticmethod
+    def initialise_target(c, key):
+        r"""
+        Return a generic pressure starting value at the inlet.
+
+        Only consulted as the last fallback tier when neither user
+        values, propagation nor the temperature field anchors covered
+        the pressure. Enthalpy starting values are generated by the
+        automatic starting value machinery instead.
+
+        Parameters
+        ----------
+        c : tespy.connections.connection.Connection
+            Connection to perform initialisation on.
+
+        key : str
+            Fluid property to retrieve.
+
+        Returns
+        -------
+        val : float
+            Starting value for pressure in SI units, 0 for no information.
+
+            .. math::
+
+                val = \begin{cases}
+                5  \cdot 10^5 & \text{key = 'p'}\\
+                5 \cdot 10^5 & \text{key = 'h'}
+                \end{cases}
+        """
+        if key == "p":
+            return 5e5
+        return 0
+
+    def entropy_balance(self):
+        r"""
+        Calculate entropy balance of combustion chamber.
+
+        Note
+        ----
+        The entropy balance makes the following parameter available:
+
+        - :code:`T_mcomb`: Thermodynamic temperature of heat of combustion
+        - :code:`S_comb`: Entropy production due to combustion
+        - :code:`S_irr`: Entropy production due to irreversibilty
+
+        The methodology for entropy analysis of combustion processes is derived
+        from :cite:`Tuschy2001`. Similar to the energy balance of a combustion
+        reaction, we need to define the same reference state for the entropy
+        balance of the combustion. The temperature for the reference state is
+        set to 25 °C and reference pressure is 1 bar. As the water in the flue
+        gas may be liquid but the thermodynamic temperature of heat of
+        combustion refers to the lower heating value, the water is forced to
+        gas at the reference point by considering evaporation.
+
+        - Reference temperature: 298.15 K.
+        - Reference pressure: 1 bar.
+
+        .. math::
+
+            T_\text{m,comb}= \frac{\dot{m}_\text{fuel} \cdot LHV}
+            {\dot{S}_\text{comb}}\\
+            \dot{S}_\text{comb}= \dot{m}_\text{fluegas} \cdot
+            \left(s_\text{fluegas}-s_\text{fluegas,ref}\right)
+            - \sum_{i=1}^2 \dot{m}_{\text{in,}i} \cdot
+            \left( s_{\text{in,}i} - s_{\text{in,ref,}i} \right)\\
+            \dot{S}_\text{irr}= 0\\
+        """
+        T_ref = 298.15
+        p_ref = 1e5
+        o = self.outl[0]
+        self.S_comb = o.m.val_SI * (
+            o.s.val_SI - s_mix_pT(p_ref, T_ref, o.fluid_data, "forced-gas")
+        )
+
+        for i in self.inl:
+            self.S_Qcomb -= i.m.val_SI * (
+                i.s.val_SI - s_mix_pT(p_ref, T_ref, i.fluid_data, "forced-gas")
+            )
+
+        self.S_irr = 0
+        self.T_mcomb = self._calc_ti() / self.S_comb

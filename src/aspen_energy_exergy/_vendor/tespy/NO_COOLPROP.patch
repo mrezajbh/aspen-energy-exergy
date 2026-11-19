@@ -1,0 +1,108 @@
+--- upstream/tespy/tools/fluid_properties/functions.py
++++ vendor/tespy/tools/fluid_properties/functions.py
+@@ -10,7 +10,10 @@
+ 
+ SPDX-License-Identifier: MIT
+ """
+-from CoolProp.CoolProp import HAPropsSI
++# Aspen-only vendor profile: no CoolProp import is attempted.
++def HAPropsSI(*args, **kwargs):
++    raise RuntimeError("Humid-air properties are disabled in the Aspen-only TESPy profile.")
++
+ 
+ from tespy.tools.global_vars import FLUID_ALIASES
+ from tespy.tools.logger import logger
+--- upstream/tespy/tools/fluid_properties/mixtures.py
++++ vendor/tespy/tools/fluid_properties/mixtures.py
+@@ -11,7 +11,10 @@
+ SPDX-License-Identifier: MIT
+ """
+ 
+-from CoolProp.CoolProp import HAPropsSI
++# Aspen-only vendor profile: no CoolProp import is attempted.
++def HAPropsSI(*args, **kwargs):
++    raise RuntimeError("Humid-air properties are disabled in the Aspen-only TESPy profile.")
++
+ 
+ from tespy.tools.global_vars import FLUID_ALIASES
+ from tespy.tools.logger import logger
+--- upstream/tespy/connections/humidairconnection.py
++++ vendor/tespy/connections/humidairconnection.py
+@@ -9,7 +9,10 @@
+ SPDX-License-Identifier: MIT
+ """
+ import numpy as np
+-from CoolProp.CoolProp import HAPropsSI
++# Aspen-only vendor profile: no CoolProp import is attempted.
++def HAPropsSI(*args, **kwargs):
++    raise RuntimeError("Humid-air properties are disabled in the Aspen-only TESPy profile.")
++
+ 
+ from tespy.tools import fluid_properties as fp
+ from tespy.tools.data_containers import ConnectionParameter
+--- upstream/tespy/tools/global_vars.py
++++ vendor/tespy/tools/global_vars.py
+@@ -8,7 +8,8 @@
+ 
+ SPDX-License-Identifier: MIT
+ """
+-import CoolProp as CP
++# Aspen-only profile: retained Aspen states supply properties.
++CP = None
+ 
+ ERR = 1e-6
+ # convergence acceptance thresholds of the solver, the block wise and the
+@@ -70,6 +71,9 @@
+ 
+     def get_fluid(self, fluid):
+         if fluid not in self.fluids:
++            if CP is None:
++                self.fluids[fluid] = {fluid}
++                return self.fluids[fluid]
+             try:
+                 self.fluids[fluid] = set(
+                     alias.replace(" ", "")
+--- upstream/tespy/tools/fluid_properties/helpers.py
++++ vendor/tespy/tools/fluid_properties/helpers.py
+@@ -13,7 +13,8 @@
+ 
+ import math
+ 
+-import CoolProp.CoolProp as CP
++# Aspen-only profile: fluid structure lookup through CoolProp is disabled.
++CP = None
+ import numpy as np
+ from scipy.optimize import brentq
+ 
+--- upstream/tespy/tools/fluid_properties/wrappers/coolprop.py
++++ vendor/tespy/tools/fluid_properties/wrappers/coolprop.py
+@@ -12,7 +12,8 @@
+ """
+ from itertools import islice
+ 
+-import CoolProp as CP
++# Aspen-only profile: this provider is unavailable; no import is attempted.
++CP = None
+ import numpy as np
+ 
+ from .base import FluidPropertyWrapper
+@@ -26,9 +27,10 @@
+ _MEMOS = {}
+ 
+ 
+-class SerializableAbstractState(CP.AbstractState):
++class SerializableAbstractState(object):
+ 
+     def __init__(self, back_end, fluid_name):
++        raise RuntimeError("CoolProp is disabled in the Aspen-only TESPy profile.")
+         self.back_end = back_end
+         self.fluid_name = fluid_name
+ 
+@@ -49,6 +51,7 @@
+         back_end : str, optional
+             CoolProp back end for the AbstractState object, by default "HEOS"
+         """
++        raise RuntimeError("CoolProp is disabled in the Aspen-only TESPy profile.")
+         super().__init__(fluid, back_end)
+ 
+         if self.back_end is None:

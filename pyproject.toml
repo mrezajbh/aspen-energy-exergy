@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aspen-energy-exergy"
+version = "0.5.1"
+description = "Stream, equipment and plant energy and exergy balances from saved Aspen Plus results"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{name = "Mohammadreza Jahanbakhsh"}]
+dependencies = [
+    "thermo>=0.6,<0.7",
+    "chemicals>=1.5.1,<2",
+    "fluids>=1.2,<2",
+    "iapws>=1.5.4,<2",
+    "numpy>=1.24,<3",
+    "pandas>=2,<4",
+    "scipy>=1.10,<2",
+    "pint==0.26.2",
+    "tabulate==0.10.0",
+    "msgspec==0.22.0",
+]
+
+[project.urls]
+Repository = "https://github.com/mrezajbh/aspen-energy-exergy"
+Issues = "https://github.com/mrezajbh/aspen-energy-exergy/issues"
+
+[project.scripts]
+aspen-energy-exergy = "aspen_energy_exergy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aspen_energy_exergy = ["profiles/*.json", "_vendor/**/*.json", "_vendor/**/*.csv", "_vendor/**/*.diff", "_vendor/**/*.patch", "_vendor/**/LICENSE*", "_vendor/**/*.md", "_vendor/**/*.txt"]

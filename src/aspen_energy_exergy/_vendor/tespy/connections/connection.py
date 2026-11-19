@@ -1,0 +1,3015 @@
+# -*- coding: utf-8
+"""Module of class Connection and class Ref.
+
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location tespy/connections/connection.py
+
+SPDX-License-Identifier: MIT
+"""
+
+import warnings
+
+import numpy as np
+import pint
+from tabulate import tabulate
+
+from tespy.components import Subsystem
+from tespy.components.component import Component
+from tespy.tools import fluid_properties as fp
+from tespy.tools import logger
+from tespy.tools.data_containers import ConfigParameter
+from tespy.tools.data_containers import ConnectionParameter
+from tespy.tools.data_containers import DataContainer
+from tespy.tools.data_containers import FluidComposition
+from tespy.tools.data_containers import OptionalEquation
+from tespy.tools.data_containers import OptionalResult
+from tespy.tools.data_containers import ReferenceEquation
+from tespy.tools.data_containers import _display_repr
+from tespy.tools.data_containers import _format_value
+from tespy.tools.data_containers import _is_numeric
+from tespy.tools.fluid_properties import CoolPropWrapper
+from tespy.tools.fluid_properties import Q_mix_ph
+from tespy.tools.fluid_properties import T_mix_ph
+from tespy.tools.fluid_properties import T_sat_p
+from tespy.tools.fluid_properties import dh_mix_dpQ
+from tespy.tools.fluid_properties import dT_mix_dph
+from tespy.tools.fluid_properties import dT_mix_pdh
+from tespy.tools.fluid_properties import dv_mix_dph
+from tespy.tools.fluid_properties import dv_mix_pdh
+from tespy.tools.fluid_properties import h_mix_pQ
+from tespy.tools.fluid_properties import h_mix_pT
+from tespy.tools.fluid_properties import phase_mix_ph
+from tespy.tools.fluid_properties import s_mix_ph
+from tespy.tools.fluid_properties import v_mix_ph
+from tespy.tools.fluid_properties import viscosity_mix_ph
+from tespy.tools.fluid_properties.functions import _MIXING_RULE_PHASE
+from tespy.tools.fluid_properties.functions import T_bubble_p
+from tespy.tools.fluid_properties.functions import T_dew_p
+from tespy.tools.fluid_properties.functions import p_bubble_T
+from tespy.tools.fluid_properties.functions import p_dew_T
+from tespy.tools.fluid_properties.functions import p_sat_TQ
+from tespy.tools.fluid_properties.helpers import get_mixture_temperature_range
+from tespy.tools.fluid_properties.helpers import single_fluid
+from tespy.tools.fluid_properties.wrappers import wrapper_registry
+from tespy.tools.global_vars import ERR
+from tespy.tools.helpers import TESPyConnectionError
+from tespy.tools.helpers import TESPyNetworkError
+from tespy.tools.helpers import _get_dependents
+from tespy.tools.helpers import _get_vector_dependents
+from tespy.tools.helpers import _is_variable
+from tespy.tools.helpers import _partial_derivative
+from tespy.tools.helpers import _partial_derivative_vecvar
+from tespy.tools.helpers import _topological_sort
+from tespy.tools.helpers import seeded_random
+from tespy.tools.units import SI_UNITS
+
+# offset of phase based starting values from the phase boundaries: it must
+# dominate the numeric derivative step so perturbations never straddle the
+# saturation kink, and it keeps starts off residual plateau edges
+PHASE_MARGIN = 1e4
+
+
+def connection_registry(type):
+    connection_registry.items[type.__name__] = type
+    return type
+
+
+connection_registry.items = {}
+
+
+def _deserialize_ref_delta(data, units=None):
+    if data.get("delta_unit") is not None and units is not None:
+        return units.ureg.Quantity(data["delta"], data["delta_unit"])
+    return data["delta"]
+
+
+class ConnectionBase:
+
+    _state_specifications = ()
+
+    _has_fluid_vector = False
+
+    def __init__(self):
+        pass
+
+    def _remap_if_subsystem(self, source, target):
+        # If the connected source or target is a subsystem we must
+        # remap the source and target to its outlet/inlet
+        if isinstance(source, Subsystem):
+            source = source.outlet
+
+        if isinstance(target, Subsystem):
+            target = target.inlet
+
+        return source, target
+
+    def _check_types(self, source, target):
+        # check input parameters
+        if not (isinstance(source, Component) and
+                isinstance(target, Component)):
+            msg = (
+                "Error creating connection. Check if source and target are "
+                "tespy.components."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+    def _check_self_connect(self, source, target):
+        if source == target:
+            msg = (
+                "Error creating connection. Cannot connect component "
+                f"{source.label} to itself."
+            )
+            logger.error(msg)
+            raise TESPyConnectionError(msg)
+
+    def _check_connector_id(self, component, connector_id, connecter_locations):
+        if connector_id not in connecter_locations:
+            msg = (
+                "Error creating connection. Specified connector for "
+                f"{component.label} of class {component.__class__.__name__} "
+                f"({connector_id})  is not available. Select one of the "
+                f"following connectors {', '.join(connecter_locations)}."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+
+    def _parameter_specification(self, key, value):
+        # Starting-value key (e.g. 'm0') - route to the base container's val0
+        if key in self.property_data0:
+            container = self.get_attr(key.replace('0', ''))
+            if value is not None and container.result_only:
+                msg = (
+                    f"The parameter {key[:-1]} of Connection {self.label} is "
+                    "result-only and cannot have a starting value."
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+            if _is_numeric(value) or value is None:
+                container.set_attr(val0=value)
+                return
+            else:
+                msg = (
+                    "You must provide a number of None for the parameter "
+                    f"{key} of Connection {self.label}."
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+
+        container = self.get_attr(key)
+        reference = getattr(container, "reference", None)
+
+        if value is None:
+            container.is_set = False
+            if reference is not None:
+                reference.is_set = False
+
+        elif isinstance(value, Ref):
+            if reference is None:
+                msg = f"Referencing {key} is not implemented."
+                logger.error(msg)
+                raise NotImplementedError(msg)
+            container.is_set = False
+            reference.accept(value)
+
+        else:
+            if reference is not None:
+                reference.is_set = False
+            container.accept(value)
+
+    def get_attr(self, key):
+        r"""
+        Get the value of a connection's attribute.
+
+        Parameters
+        ----------
+        key : str
+            The attribute you want to retrieve.
+
+        Returns
+        -------
+        out :
+            Specified attribute.
+        """
+        if key in self.__dict__:
+            return self.__dict__[key]
+        reference = self._deprecated_reference(key)
+        if reference is not None:
+            return reference
+        msg = f"Connection has no attribute '{key}'."
+        logger.error(msg)
+        raise KeyError(msg)
+
+    def _deprecated_reference(self, key):
+        """The reference equation of a parameter addressed by the former
+        :code:`<parameter>_ref` name."""
+        if not key.endswith("_ref"):
+            return None
+        container = self.__dict__.get("property_data", {}).get(key[:-4])
+        reference = getattr(container, "reference", None)
+        if reference is None:
+            return None
+        warnings.warn(
+            f"The attribute '{key}' is deprecated and will be removed in "
+            f"version 0.13, use '{key[:-4]}.reference' instead.",
+            FutureWarning, stacklevel=3
+        )
+        return reference
+
+    def __getattr__(self, key):
+        reference = self._deprecated_reference(key)
+        if reference is None:
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{key}'"
+            )
+        return reference
+
+    def __repr__(self):
+        return _display_repr(self)
+
+    __str__ = __repr__
+
+    def _repr_compact(self):
+        return (
+            f"{type(self).__name__}({self.label!r}, "
+            f"{self.source.label}:{self.source_id} -> "
+            f"{self.target.label}:{self.target_id})"
+        )
+
+    def _repr_extensive(self):
+        title = self._repr_compact()
+        rows = []
+        for key, data in self.property_data.items():
+            if isinstance(data, ConnectionParameter):
+                reference = data.reference
+                if reference is not None and reference.is_set:
+                    ref = reference.ref
+                    rows.append([
+                        key,
+                        f"{ref.factor} * {key}({ref.obj.label!r}) "
+                        f"+ {ref.delta}",
+                        "", "", "set"
+                    ])
+                    continue
+                if not data.is_set and np.isnan(data.val):
+                    # only prints specified values before first solve
+                    continue
+                rows.append([
+                    key,
+                    _format_value(data.val),
+                    data._display_unit(),
+                    f"{data.val_SI:.4e}",
+                    "set" if data.is_set else ""
+                ])
+            elif isinstance(data, FluidComposition):
+                for fluid, x in data.val.items():
+                    rows.append([
+                        f"{key}[{fluid}]",
+                        _format_value(x),
+                        "", "",
+                        "set" if fluid in data.is_set else ""
+                    ])
+            elif isinstance(data, OptionalEquation):
+                if data.is_set:
+                    rows.append([key, "equation", "", "", "set"])
+        if not rows:
+            return f"{title}\nno specifications or results"
+        table = tabulate(
+            rows, headers=["property", "value", "unit", "SI value", "spec"],
+            tablefmt="simple", disable_numparse=True,
+            colalign=("left", "right", "left", "right", "left")
+        )
+        return "\n".join([title, "", table])
+
+    def _serialize(self, units=None):
+        export = {}
+        export.update({"source": self.source.label})
+        export.update({"target": self.target.label})
+        for k in self._serializable():
+            export.update({k: self.get_attr(k)})
+        for k in self.property_data:
+            data = self.get_attr(k)
+            export.update({k: data._serialize(units)})
+            reference = getattr(data, "reference", None)
+            if reference is not None:
+                export.update({f"{k}_ref": reference._serialize(units)})
+
+        return {self.label: export}
+
+    def _references(self):
+        """Reference equations of the parameters by the parameter name."""
+        return {
+            k: v.reference for k, v in self.property_data.items()
+            if getattr(v, "reference", None) is not None
+        }
+
+    @staticmethod
+    def _serializable():
+        return [
+            "source_id", "target_id",
+            "design_path", "design", "offdesign",
+            "local_design", "local_offdesign",
+            "printout"
+        ]
+
+    def get_variables(self):
+        return {}
+
+    def _mark_consumed_parameters(self):
+        """State specifications and variables accept specifications although
+        they carry no equation of their own."""
+        for name in set(self._state_specifications) | set(self.get_variables()):
+            if name in self.property_data:
+                self.property_data[name]._consumed = True
+
+    def _build_parameters(self):
+        parameters = {}
+        for k, v in self.property_data.items():
+            if v.func is not None or v.structure_matrix is not None:
+                parameters[k] = v
+            reference = getattr(v, "reference", None)
+            if reference is not None:
+                parameters[f"{k}_ref"] = reference
+        return parameters
+
+    def _init_common(self, source, outlet_id, target, inlet_id, label, **kwargs):
+        self.label = f"{source.label}:{outlet_id}_{target.label}:{inlet_id}"
+        if label is not None:
+            self.label = label
+            if not isinstance(label, str):
+                msg = "Please provide the label as string."
+                logger.error(msg)
+                raise TypeError(msg)
+
+        self.source = source
+        self.source_id = outlet_id
+        self.target = target
+        self.target_id = inlet_id
+
+        self.new_design = True
+        self.design_path = None
+        self.design = []
+        self.offdesign = []
+        self.local_design = False
+        self.local_offdesign = False
+        self.printout = True
+
+        self.property_data = self.get_parameters()
+        self.property_data0 = [f"{x}0" for x in self.property_data.keys()]
+        self._optional_results_stale = False
+        self.parameters = self._build_parameters()
+        self.__dict__.update(self.property_data)
+        self._mark_consumed_parameters()
+        logger.debug(
+            f"Created connection from {self.source.label} ({self.source_id}) "
+            f"to {self.target.label} ({self.target_id})."
+        )
+        self.set_attr(**kwargs)
+
+    def _set_design_list(self, key, value):
+        if not isinstance(value, list):
+            msg = f"Please provide the {key} parameters as list!"
+            logger.error(msg)
+            raise TypeError(msg)
+        if not set(value).issubset(self.property_data.keys()):
+            params = ', '.join(self.property_data.keys())
+            msg = (
+                f"Available parameters for (off-)design specification are: {params}."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+        self.__dict__[key] = value
+
+    def _set_path_attr(self, value):
+        self.design_path = value
+        self.new_design = True
+
+    def _set_bool_attr(self, key, value):
+        if not isinstance(value, bool):
+            msg = f"Please provide the {key} parameter as boolean."
+            logger.error(msg)
+            raise TypeError(msg)
+        self.__dict__[key] = value
+
+    def _reset_design(self, redesign):
+        for value in self.get_variables().values():
+            value.design = np.nan
+
+        self.new_design = True
+
+        if redesign:
+            for var in self.design:
+                self.get_attr(var).is_set = True
+
+            for var in self.offdesign:
+                self.get_attr(var).is_set = False
+
+    def _presolve(self):
+        self._presolve_determinations = []
+        return []
+
+    def _debug_state(self):
+        """Properties reported in the solver debugging output.
+
+        Returns a list of tuples of property name, SI value and the
+        container in case the property is part of the variable space,
+        None for derived values.
+        """
+        return [
+            (prop, container.val_SI, container)
+            for prop, container in self.get_variables().items()
+        ]
+
+    def _seed_starting_values(self, units):
+        return []
+
+    def _temperature_hint(self):
+        return None
+
+    def _apply_temperature_field(self, field, covered, seeded):
+        return []
+
+    def _guess_starting_values(self, units, covered):
+        return []
+
+    def _finalize_starting_values(self, units, covered, seeded, nw):
+        pass
+
+    def _precalc_guess_values_for_references(self):
+        """precalculate starting values for specified temperature
+        references
+        """
+        pass
+
+    def _calc_result_parameters(self):
+        """Calculate the parameters with a calc method in dependency order.
+        Called right after the temperature so that the pressure enthalpy
+        state of the property back end is reused from its cache."""
+        calc_items = {
+            k: p for k, p in self.property_data.items()
+            if getattr(p, "calc", None) is not None
+        }
+        for k in _topological_sort(calc_items):
+            p = calc_items[k]
+            p.val_SI = p.calc(**p.calc_params)
+
+    def primary_ref_structure_matrix(self, k, **kwargs):
+        r"""Create a linear relationship between two variables
+
+        .. math::
+
+            0 = var - \left(
+            var_\text{ref} \cdot \text{factor} + \text{delta}
+            \right)
+
+        Parameters
+        ----------
+        k : int
+            equation set number to create the structure matrix for Network
+            preprocessing
+        """
+        variable = kwargs["variable"]
+        ref = self.get_attr(variable).reference.ref
+        self._structure_matrix[k, self.get_attr(variable).sm_col] = 1
+        self._structure_matrix[k, ref.obj.get_attr(variable).sm_col] = -ref.factor
+        self._rhs[k] = ref.delta_SI
+
+    def _preprocess(self, row_idx):
+        self.num_eq = 0
+        self._pressure_from_saturation = False
+
+        self._structure_matrix = {}
+        self._rhs = {}
+        self._equation_set_lookup = {}
+
+        for parameter, container in self.parameters.items():
+            if container.is_set and (container.func is not None or container.structure_matrix is not None):
+                num_eq = container.num_eq
+                # the row index matches the location in the network's rhs
+                # and matrix
+                for i in range(self.num_eq, self.num_eq + num_eq):
+                    self._equation_set_lookup[i + row_idx] = parameter
+                    self._rhs[i + row_idx] = 0
+                # the structure matrix function also computes the rhs
+                if container.structure_matrix is not None:
+                    container.structure_matrix(
+                        row_idx + self.num_eq, **container.func_params
+                    )
+
+                self.num_eq += num_eq
+
+    def _prepare_for_solver(self, system_dependencies, eq_counter):
+        self.num_eq = 0
+        self.it = 0
+        self.equations = {}
+        self._equation_lookup = {}
+        self._equation_scalar_dependents_lookup = {}
+        self._equation_vector_dependents_lookup = {}
+
+        for eq_num, value in self._equation_set_lookup.items():
+            if eq_num in system_dependencies:
+                continue
+
+            if value not in self.equations:
+                data = self.parameters[value]
+                self.equations.update({value: data})
+                self._assign_dependents_and_eq_mapping(
+                    value, data, self.equations, eq_counter
+                )
+                self.num_eq += data.num_eq
+                eq_counter += data.num_eq
+
+        self.residual = {}
+        self.jacobian = {}
+
+        return eq_counter
+
+    def _assign_dependents_and_eq_mapping(self, value, data, eq_dict, eq_counter):
+        if data.dependents is None:
+            scalar_dependents = [[] for _ in range(data.num_eq)]
+            vector_dependents = [{} for _ in range(data.num_eq)]
+        else:
+            dependents = data.dependents(**data.func_params)
+            if type(dependents) == list:
+                scalar_dependents = _get_dependents(dependents)
+                vector_dependents = [{} for _ in range(data.num_eq)]
+            else:
+                scalar_dependents = _get_dependents(dependents["scalars"])
+                vector_dependents = _get_vector_dependents(dependents["vectors"])
+
+                # this is a temporary fix
+                if len(vector_dependents) < data.num_eq:
+                    vector_dependents = [{} for _ in range(data.num_eq)]
+
+        eq_dict[value]._scalar_dependents = scalar_dependents
+        eq_dict[value]._sorted_scalar_dependents = None
+        eq_dict[value]._vector_dependents = vector_dependents
+        eq_dict[value]._first_eq_index = eq_counter
+
+        for i in range(data.num_eq):
+            self._equation_lookup[eq_counter + i] = (value, i)
+            self._equation_scalar_dependents_lookup[eq_counter + i] = scalar_dependents[i]
+            self._equation_vector_dependents_lookup[eq_counter + i] = vector_dependents[i]
+
+    def _partial_derivative(self, var, eq_num, value, increment_filter=None, **kwargs):
+        result = _partial_derivative(var, value, increment_filter, **kwargs)
+        if result is not None:
+            self.jacobian[eq_num, var.J_col] = result
+
+    def _property_bounds(self, prop, nw):
+        return None
+
+    def _adjust_to_property_limits(self, nw):
+        pass
+
+    @classmethod
+    def _print_attributes(cls):
+        return []
+
+    @classmethod
+    def _result_attributes(cls):
+        return []
+
+    @classmethod
+    def _get_result_cols(cls, all_fluids):
+        return []
+
+    def calc_results(self):
+        return True
+
+    def collect_results(self, all_fluids):
+        return None
+
+    def optional_results(self):
+        """The :py:class:`~tespy.tools.data_containers.OptionalResult`
+        containers of the connection by name."""
+        return {
+            key: data for key, data in self.property_data.items()
+            if isinstance(data, OptionalResult)
+        }
+
+    def reset_optional_results(self):
+        """Discard the optional results, e.g. after a new solution."""
+        for data in self.optional_results().values():
+            data.accept(None)
+        self._optional_results_stale = False
+
+    def collect_optional_results(self):
+        """Values and units of the optional results that have been
+        calculated, keyed like the result columns."""
+        self._optional_results_stale = False
+        return {
+            k: v for key, data in self.optional_results().items()
+            if data.is_calculated
+            for k, v in ((key, data.val), (f"{key}_unit", data.unit))
+        }
+
+    def _get_design_state_SI(self, data, units):
+        state = {}
+        for var in self._result_attributes():
+            unit_key = f"{var}_unit"
+            if var not in data or unit_key not in data:
+                continue
+            unit = data[unit_key]
+            if unit == "C":
+                unit = "degC" if var == "T" else "delta_degC"
+            elif "kgK" in unit:
+                unit = unit.replace("kgK", "kg/K")
+            elif unit == "-":
+                unit = "1"
+            param = self.get_attr(var)
+            state[var] = units.value_to_SI(
+                float(data[var]), unit, param.quantity
+            )
+        return state
+
+    def _set_design_params(self, data, units):
+        for var, val in self._get_design_state_SI(data, units).items():
+            self.get_attr(var).design = val
+
+    def _set_starting_values(self, data, units):
+        for prop in self.get_variables():
+            var = self.get_attr(prop)
+            var.val0 = units.ureg.Quantity(
+                float(data[prop]),
+                data[f"{prop}_unit"]
+            )
+
+    def _deserialize(self, data, all_connections, units=None):
+        arglist = [
+            _ for _ in data
+            if _ not in ["source", "source_id", "target", "target_id", "label", "fluid"]
+            and "ref" not in _
+        ]
+
+        for arg in arglist:
+            if arg not in self.__dict__:
+                msg = (
+                    f"The parameter {arg} passed to construct  "
+                    f"{self.__class__.__name__} {self.label} is not an "
+                    "attribute of this class. Skipping it!"
+                )
+                logger.warning(msg)
+                continue
+            container = self.get_attr(arg)
+            if isinstance(container, DataContainer):
+                container.set_attr(**data[arg])
+            else:
+                self.set_attr(**{arg: data[arg]})
+
+        for key, reference in self._references().items():
+            ref_data = data.get(f"{key}_ref")
+            if not ref_data:
+                continue
+            ref = Ref(
+                all_connections[ref_data["conn"]],
+                ref_data["factor"],
+                _deserialize_ref_delta(ref_data, units)
+            )
+            # do not use accept here: it would force is_set to True on the
+            # reference and False on the base property, discarding the
+            # serialized flags
+            reference.set_attr(
+                ref=ref,
+                is_set=ref_data.get("is_set", True),
+                unit=ref_data.get("unit")
+            )
+
+    def _save_specifications(self, units):
+        specs = {}
+        for key, reference in self._references().items():
+            if reference.is_set:
+                specs[f"{key}_ref"] = reference._serialize()
+        for key, container in self.property_data.items():
+            data = {}
+            if container.is_set:
+                if isinstance(container, FluidComposition):
+                    data = {
+                        "val": {f: container.val[f] for f in container.is_set},
+                        "is_set": list(container.is_set)
+                    }
+                elif isinstance(container, ConnectionParameter):
+                    data = {
+                        "val": container.val,
+                        "unit": container._unit_for_export(units),
+                        "is_set": True
+                    }
+                else:
+                    data = {"is_set": True}
+            if isinstance(container, ConnectionParameter) and not np.isnan(container._val0):
+                data["val0"] = float(container._val0)
+                if container._val0_unit is None:
+                    data["val0_unit"] = units.canonical(
+                        units.default[container.quantity]
+                    )
+                else:
+                    data["val0_unit"] = container._val0_unit
+            elif isinstance(container, FluidComposition) and container.val0:
+                data["val0"] = {
+                    f: float(x) for f, x in container.val0.items()
+                }
+            if data:
+                specs[key] = data
+        if specs and self.good_starting_values:
+            specs["good_starting_values"] = True
+        return specs
+
+    def _clear_specifications(self):
+        for container in self.property_data.values():
+            if isinstance(container, FluidComposition):
+                container.is_set = set()
+            else:
+                container.is_set = False
+        for reference in self._references().values():
+            reference.is_set = False
+
+    def _restore_specifications(self, data, all_connections, units):
+        self.good_starting_values = data.pop("good_starting_values", False)
+        references = self._references()
+        for key, param_data in data.items():
+            if key.endswith("_ref") and key[:-4] in references:
+                container = references[key[:-4]]
+            else:
+                container = self.get_attr(key)
+            if isinstance(container, ReferenceEquation):
+                ref = Ref(
+                    all_connections[param_data["conn"]],
+                    param_data["factor"],
+                    _deserialize_ref_delta(param_data, units)
+                )
+                container.set_attr(
+                    ref=ref, is_set=True, unit=param_data["unit"]
+                )
+            elif isinstance(container, FluidComposition):
+                if "val" in param_data:
+                    container.val.update(param_data["val"])
+                    container.is_set = set(param_data["is_set"])
+                if "val0" in param_data:
+                    container.val0.update(param_data["val0"])
+            else:
+                val0 = param_data.pop("val0", None)
+                val0_unit = param_data.pop("val0_unit", None)
+                if param_data:
+                    container.set_attr(**param_data)
+                if val0 is not None:
+                    container.val0 = units.ureg.Quantity(val0, val0_unit)
+
+
+@connection_registry
+class Connection(ConnectionBase):
+    r"""
+    Class connection is the container for fluid properties between components.
+
+    Parameters
+    ----------
+
+    design : list
+        List containing design parameters (stated as String).
+
+    design_path : str
+        Path to the individual design case for this connection.
+
+    e_M : float
+        Specific mechanical exergy. Quantity: :code:`specific_energy`. Optional
+        result - calculated on request only, e.g. by an exergy evaluation.
+
+    E_M : float
+        Mechanical exergy flow. Quantity: :code:`power`. Optional result -
+        calculated on request only, e.g. by an exergy evaluation.
+
+    e_PH : float
+        Specific physical exergy. Quantity: :code:`specific_energy`. Optional
+        result - calculated on request only, e.g. by an exergy evaluation.
+
+    E_PH : float
+        Physical exergy flow. Quantity: :code:`power`. Optional result -
+        calculated on request only, e.g. by an exergy evaluation.
+
+    e_T : float
+        Specific thermal exergy. Quantity: :code:`specific_energy`. Optional
+        result - calculated on request only, e.g. by an exergy evaluation.
+
+    E_T : float
+        Thermal exergy flow. Quantity: :code:`power`. Optional result -
+        calculated on request only, e.g. by an exergy evaluation.
+
+    fluid : dict
+        Mass fractions of the fluid composition (system variable).
+
+    fluid_balance : bool
+        Apply an equation which closes the fluid balance with at least two
+        unknown fluid mass fractions.
+        Equation: :py:meth:`fluid_balance_func <tespy.connections.connection.Connection.fluid_balance_func>`.
+
+    h : float, Ref
+        Mass specific enthalpy of the fluid (system variable).
+
+    label : str
+        The label of the connection.
+
+    local_design : bool
+        Treat this connection in design mode in an offdesign calculation.
+
+    local_offdesign : bool
+        Treat this connection in offdesign mode in a design calculation.
+
+    m : float, Ref
+        Mass flow of the fluid (system variable).
+
+    offdesign : list
+        List containing offdesign parameters (stated as String).
+
+    p : float, Ref
+        Absolute pressure of the fluid (system variable).
+
+    printout : bool
+        Include this connection in the network's results printout.
+
+    s : float
+        Specific entropy of the fluid. Result only - calculated after each
+        solve.
+
+    T : float, Ref
+        Temperature of the fluid.
+        Equation: :py:meth:`T_func <tespy.connections.connection.Connection.T_func>`.
+
+    T_bubble : float
+        Determine pressure based on the provided bubble temperature of the
+        fluid.
+
+    T_dew : float
+        Determine pressure based on the provided dew temperature of the fluid.
+
+    td_bubble : float
+        Subcooling temperature difference to bubble line temperature.
+        Equation: :py:meth:`td_bubble_func <tespy.connections.connection.Connection.td_bubble_func>`.
+
+    td_dew : float
+        Superheating temperature difference to dew line temperature.
+        Equation: :py:meth:`td_dew_func <tespy.connections.connection.Connection.td_dew_func>`.
+
+    v : float, Ref
+        Volumetric flow of the fluid.
+        Equation: :py:meth:`v_func <tespy.connections.connection.Connection.v_func>`.
+
+    vol : float
+        Specific volume of the fluid. Result only - calculated after each solve.
+
+    x : float
+        Vapor mass fraction/quality of the two-phase fluid.
+        Equation: :py:meth:`x_func <tespy.connections.connection.Connection.x_func>`.
+
+    Note
+    ----
+    - The fluid balance parameter applies a balancing of the fluid vector on
+      the specified conntion to 100 %. For example, you have four fluid
+      components (a, b, c and d) in your vector, you set two of them
+      (a and b) and want the other two (components c and d) to be a result of
+      your calculation. If you set this parameter to True, the equation
+      (0 = 1 - a - b - c - d) will be applied.
+
+    - The specification of values for design and/or offdesign is used for
+      automatic switch from design to offdesign calculation: All parameters
+      given in 'design', e.g. :code:`design=['T', 'p']`, are unset in any
+      offdesign calculation, parameters given in 'offdesign' are set for
+      offdesign calculation.
+
+    Example
+    -------
+    This example shows how to create connections and specify parameters. First
+    create the required components and connect them in the next step. After
+    that, it is possible specify parameters with the :code:`set_attr` method.
+
+    >>> from tespy.components import Sink, Source
+    >>> from tespy.connections import Connection, Ref
+    >>> so1 = Source('source1')
+    >>> so2 = Source('source2')
+    >>> si1 = Sink('sink1')
+    >>> si2 = Sink('sink2')
+    >>> so_si1 = Connection(so1, 'out1', si1, 'in1', label='connection 1')
+    >>> so_si2 = Connection(so2, 'out1', si2, 'in1')
+    >>> so_si1.label
+    'connection 1'
+    >>> so_si2.label
+    'source2:out1_sink2:in1'
+
+    There are different ways of setting parameters on connections: Specify
+
+    - a numeric value  (for attributes mass flow, pressure and enthalpy)
+    - a numeric starting value (for attributes mass flow, pressure and
+      enthalpy)
+    - a dictionary (for attributes fluid and fluid0)
+    - a boolean value (for attributes fluid_balance, local_design,
+      local_offdesign).
+    - a referenced value (mass flow, pressure, temperature, enthalpy).
+    - numpy.nan or None (unsetting a value).
+    - a string (for attributes design_path and state).
+    - a list (for attributes design and offdesign).
+
+    >>> so_si1.set_attr(v=0.012, m0=10, p=5, h=400, fluid={'H2O': 1})
+    >>> so_si2.set_attr(m=Ref(so_si1, 2, -5), h0=700, T=200,
+    ... fluid={'N2': 1}, fluid_balance=True,
+    ... design=['T'], offdesign=['m', 'v'])
+
+    The set_attr method automatically converts your input in data_container
+    information.
+
+    >>> type(so_si1.v)
+    <class 'tespy.tools.data_containers.ConnectionParameter'>
+    >>> type(so_si1.fluid)
+    <class 'tespy.tools.data_containers.FluidComposition'>
+
+    If you want get a specific value use the logic: connection.property.*.
+    Additionally, it is possible to use the :code:`get_attr` method.
+
+    >>> so_si1.m.val0
+    10
+    >>> so_si1.m.is_set
+    False
+    >>> so_si1.m.get_attr('is_set')
+    False
+    >>> type(so_si2.m.reference.ref)
+    <class 'tespy.connections.connection.Ref'>
+    >>> so_si2.fluid_balance.is_set
+    True
+    >>> so_si2.m.reference.ref.get_attr('delta')
+    -5
+    >>> so_si2.m.reference.is_set
+    True
+    >>> type(so_si2.m.reference.ref.get_attr('obj'))
+    <class 'tespy.connections.connection.Connection'>
+
+    Unset the specified temperature:
+
+    >>> so_si2.T.is_set
+    True
+    >>> so_si2.set_attr(T=None)
+    >>> so_si2.T.is_set
+    False
+
+    Bubble line or dew line temperature difference:
+
+    >>> so_si2.set_attr(td_bubble=5)
+    >>> so_si2.td_bubble.is_set
+    True
+    >>> so_si2.td_bubble.val
+    5.0
+    >>> so_si2.set_attr(td_bubble=None)
+    >>> so_si2.td_bubble.is_set
+    False
+    >>> so_si2.set_attr(td_dew=5)
+    >>> so_si2.td_dew.is_set
+    True
+    >>> so_si2.td_dew.val
+    5.0
+    >>> so_si2.set_attr(td_dew=None)
+    >>> so_si2.td_dew.is_set
+    False
+
+    Specify the state keyword: The fluid will be forced to liquid or gaseous
+    state in this case.
+
+    >>> so_si2.set_attr(state='l')
+    >>> so_si2.state.is_set
+    True
+    >>> so_si2.set_attr(state=None)
+    >>> so_si2.state.is_set
+    False
+    >>> so_si2.set_attr(state='g')
+    >>> so_si2.state.is_set
+    True
+    >>> so_si2.set_attr(state=None)
+    >>> so_si2.state.is_set
+    False
+    """
+
+    _has_fluid_vector = True
+    _state_specifications = (
+        "p", "h", "T", "x", "td_bubble", "td_dew", "T_dew", "T_bubble"
+    )
+
+    def __init__(self, source, outlet_id, target, inlet_id,
+                 label=None, **kwargs):
+
+        source, target = self._remap_if_subsystem(source, target)
+        self._check_types(source, target)
+        self._check_self_connect(source, target)
+        self._check_connector_id(source, outlet_id, source.outlets())
+        self._check_connector_id(target, inlet_id, target.inlets())
+
+        self.state = ConfigParameter(
+            dtype="str", options=["l", "g"],
+            description="phase the fluid is kept in, liquid or gas"
+        )
+        self.phase = ConfigParameter(dtype="str")
+        self.mixing_rule = None
+        self._fluid_data = None
+        self._init_common(source, outlet_id, target, inlet_id, label, **kwargs)
+
+    def _reset_design(self, redesign):
+        self.fluid.design = {}
+        super()._reset_design(redesign)
+
+    def set_attr(self, **kwargs):
+        r"""
+        Set, reset or unset attributes of a connection.
+
+        Parameters
+        ----------
+        m : float, tespy.connections.connection.Ref
+            Mass flow specification.
+
+        m0 : float
+            Starting value specification for mass flow.
+
+        p : float, tespy.connections.connection.Ref
+            Pressure specification.
+
+        p0 : float
+            Starting value specification for pressure.
+
+        h : float, tespy.connections.connection.Ref
+            Enthalpy specification.
+
+        h0 : float
+            Starting value specification for enthalpy.
+
+        fluid : dict
+            Fluid composition specification.
+
+        fluid0 : dict
+            Starting value specification for fluid composition.
+
+        fluid_balance : boolean
+            Fluid balance equation specification.
+
+        x : float
+            Gas phase mass fraction specification.
+
+        T : float, tespy.connections.connection.Ref
+            Temperature specification.
+
+        v : float
+            Volumetric flow specification.
+
+        state : str
+            State of the pure fluid on this connection: liquid ('l') or gaseous
+            ('g').
+
+        design : list
+            List containing design parameters (stated as string).
+
+        offdesign : list
+            List containing offdesign parameters (stated as string).
+
+        design_path : str
+            Path to individual design case for this connection.
+
+        local_offdesign : boolean
+            Treat this connection in offdesign mode in a design calculation.
+
+        local_design : boolean
+            Treat this connection in design mode in an offdesign calculation.
+
+        printout : boolean
+            Include this connection in the network's results printout.
+
+        Note
+        ----
+        - The fluid balance parameter applies a balancing of the fluid vector
+          on the specified connection to 100 %. For example, you have four
+          fluid components (a, b, c and d) in your vector, you set two of them
+          (a and b) and want the other two (components c and d) to be a result
+          of your calculation. If you set this parameter to True, the equation
+          (0 = 1 - a - b - c - d) will be applied.
+        - The specification of values for design and/or offdesign is used for
+          automatic switch from design to offdesign calculation: All parameters
+          given in 'design', e.g. :code:`design=['T', 'p']`, are unset in any
+          offdesign calculation, parameters given in 'offdesign' are set for
+          offdesign calculation.
+        - The property state is applied on pure fluids only. If you specify the
+          desired state of the fluid at a connection the convergence check will
+          adjust the enthalpy values of that connection for the first
+          iterations in order to meet the state requirement.
+        """
+        for key, value in kwargs.items():
+            if key == 'label':
+                msg = 'Label can only be specified on instance creation.'
+                logger.error(msg)
+                raise TESPyConnectionError(msg)
+            elif 'fluid' in key:
+                self._fluid_specification(key, value)
+            elif key in self.property_data or key in self.property_data0:
+                self._parameter_specification(key, value)
+            elif key == 'state':
+                self._set_state(value)
+            elif key in ('design', 'offdesign'):
+                self._set_design_list(key, value)
+            elif key == 'design_path':
+                self._set_path_attr(value)
+            elif key in ('printout', 'local_design', 'local_offdesign'):
+                self._set_bool_attr(key, value)
+            elif key == 'mixing_rule':
+                self.mixing_rule = value
+            else:
+                msg = f"Connection has no attribute {key}."
+                logger.error(msg)
+                raise KeyError(msg)
+
+    def _set_state(self, value):
+        try:
+            self.state.accept(value)
+        except (TypeError, ValueError) as e:
+            msg = f"Bad value for state of connection {self.label}: {e}"
+            logger.error(msg)
+            raise type(e)(msg) from e
+
+    def _fluid_specification(self, key, value):
+
+        self._check_fluid_datatypes(key, value)
+
+        if key == "fluid":
+            # remove the old values in the fluid vector
+            self.fluid.val = dict()
+            self.fluid.is_set = set()
+            self.fluid.back_end = dict()
+            for fluid, fraction in value.items():
+                if "::" in fluid:
+                    back_end, fluid = fluid.split("::")
+                else:
+                    back_end = None
+
+                if fraction is None:
+                    if fluid in self.fluid.is_set:
+                        self.fluid.is_set.remove(fluid)
+
+                else:
+                    self.fluid.val[fluid] = fraction
+                    self.fluid.is_set.add(fluid)
+                    self.fluid.back_end[fluid] = back_end
+
+        elif key == "fluid0":
+            self.fluid.val0.update(value)
+
+        elif key == "fluid_engines":
+            self.fluid.engine = value
+
+        elif key == "fluid_balance":
+            self.fluid_balance.is_set = value
+
+        elif key == "fluid_wrapper_kwargs":
+            self.fluid.wrapper_kwargs = value
+
+        else:
+            msg = f"Connections do not have an attribute named {key}"
+            logger.error(msg)
+            raise KeyError(msg)
+
+    def _check_fluid_datatypes(self, key, value):
+        if key == "fluid_balance":
+            if not isinstance(value, bool):
+                msg = "Datatype for 'fluid_balance' must be boolean."
+                logger.error(msg)
+                raise TypeError(msg)
+        else:
+            if not isinstance(value, dict):
+                msg = "Datatype for fluid vector specification must be dict."
+                logger.error(msg)
+                raise TypeError(msg)
+
+    def _serialize(self, units=None):
+        export = super()._serialize(units)
+        export[self.label].update({"state": self.state._serialize()})
+        return export
+
+    def _deserialize(self, data, all_connections, units=None):
+        super()._deserialize(data, all_connections, units)
+
+        for f, engine in data["fluid"]["engine"].items():
+            data["fluid"]["engine"][f] = wrapper_registry.items[engine]
+
+        self.fluid.set_attr(**data["fluid"])
+        self._create_fluid_wrapper()
+
+    def _serializable(self):
+        return super()._serializable() + ["mixing_rule"]
+
+    def _create_fluid_wrapper(self):
+        for fluid in self.fluid.val:
+            if fluid in self.fluid.wrapper:
+                continue
+
+            if fluid not in self.fluid.engine:
+                self.fluid.engine[fluid] = CoolPropWrapper
+
+            back_end = None
+            if fluid in self.fluid.back_end:
+                back_end = self.fluid.back_end[fluid]
+            else:
+                self.fluid.back_end[fluid] = None
+
+            wrapper_kwargs = {}
+            if fluid in self.fluid.wrapper_kwargs:
+                wrapper_kwargs = self.fluid.wrapper_kwargs[fluid]
+
+            self.fluid.wrapper[fluid] = self.fluid.engine[fluid](
+                fluid, back_end, **wrapper_kwargs
+            )
+
+        self._fluid_data = {
+            fluid: {
+                "wrapper": self.fluid.wrapper[fluid],
+                "mass_fraction": self.fluid.val[fluid],
+            }
+            for fluid in self.fluid.val
+        }
+
+    def _seed_starting_values(self, units):
+        """Impose user provided or previous solution starting values.
+
+        Returns the reference containers seeded this way: they act as the
+        fixed points of the starting value propagation.
+        """
+        seeded = []
+        for key, variable in self.get_variables().items():
+            if variable.is_var:
+                if self.good_starting_values or not np.isnan(variable.val0):
+                    variable.set_SI_from_val0(units)
+                    variable.set_reference_val_SI(variable._val_SI)
+                    seeded.append(variable._reference_container)
+        # temperature and quality guesses are consumed by the automatic
+        # starting value machinery, the unit system is only at hand here;
+        # an explicitly set guess is newer information than a previous
+        # solution and overrides it until unset
+        for name in ("T", "x"):
+            prop = self.property_data.get(name)
+            if prop is not None and not prop.is_set and not np.isnan(prop.val0):
+                prop.set_SI_from_val0(units)
+        return seeded
+
+    def _declared_state(self):
+        """Resolve the state expectation of the adjacent components."""
+        source_state = self.source.initial_state(self.source_id)
+        target_state = self.target.initial_state(self.target_id)
+        if source_state is None:
+            return target_state
+        if target_state is None:
+            return source_state
+        if source_state["phase"] == target_state["phase"]:
+            merged = dict(target_state)
+            merged.update(source_state)
+            return merged
+        msg = (
+            "Conflicting phase expectations on connection "
+            f"{self.label}: {self.source.label}:{self.source_id} declares "
+            f"{source_state['phase']}, {self.target.label}:{self.target_id} "
+            f"declares {target_state['phase']}."
+        )
+        logger.debug(msg)
+        return None
+
+    def _h_for_state(self, state):
+        """Enthalpy value and phase region bounds for a state expectation.
+
+        Returns a tuple (value, lower, upper) with None entries where
+        unavailable or unbounded, or None if no value can be derived. The
+        phase refers to the dome sides below the critical pressure and to
+        the sides of the critical isotherm above it; for mixtures and
+        backends without a two phase dome only a temperature hint can
+        provide a value and there is no region to project into.
+        """
+        phase = state["phase"]
+        T_hint = state.get("T")
+        p = self.p.val_SI
+        fluid = fp.single_fluid(self.fluid_data)
+        try:
+            if fluid is None or self.fluid.wrapper[fluid]._T_crit is None:
+                expected = _MIXING_RULE_PHASE.get(self.mixing_rule)
+                token = {"liquid": "l", "gas": "g"}.get(phase)
+                if (
+                        fluid is None and expected is not None
+                        and token is not None and expected != token
+                    ):
+                    msg = (
+                        f"The phase expectation {phase} on connection "
+                        f"{self.label} does not match the mixing rule "
+                        f"{self.mixing_rule}."
+                    )
+                    logger.debug(msg)
+                    return None
+                if T_hint is None:
+                    return None
+                value = fp.h_mix_pT(
+                    p, T_hint, self.fluid_data, self.mixing_rule
+                )
+                return value, None, None
+
+            wrapper = self.fluid.wrapper[fluid]
+            if p < wrapper._p_crit:
+                if phase == "liquid":
+                    lower = None
+                    upper = wrapper.h_pQ(p, 0) - PHASE_MARGIN
+                    value = upper
+                elif phase == "gas":
+                    lower = wrapper.h_pQ(p, 1) + PHASE_MARGIN
+                    upper = None
+                    value = lower
+                else:
+                    lower = wrapper.h_pQ(p, 0) + PHASE_MARGIN
+                    upper = wrapper.h_pQ(p, 1) - PHASE_MARGIN
+                    value = wrapper.h_pQ(p, 0.5)
+            else:
+                if phase == "two-phase":
+                    return None
+                divider = wrapper.h_pT(p, wrapper._T_crit)
+                if phase == "liquid":
+                    lower = None
+                    upper = divider - PHASE_MARGIN
+                    value = min(wrapper.h_pT(p, wrapper._T_crit * 0.9), upper)
+                else:
+                    lower = divider + PHASE_MARGIN
+                    upper = None
+                    value = max(wrapper.h_pT(p, wrapper._T_crit * 1.2), lower)
+
+            if T_hint is not None:
+                try:
+                    value = wrapper.h_pT(p, T_hint)
+                except ValueError:
+                    pass
+                if lower is not None:
+                    value = max(value, lower)
+                if upper is not None:
+                    value = min(value, upper)
+        except (ValueError, NotImplementedError):
+            return None
+        return value, lower, upper
+
+    def _temperature_hint(self):
+        """Temperature of this connection as far as the specifications,
+        presolved values or a user provided guess determine it, or None."""
+        if self.T.is_set:
+            return self.T.val_SI
+        if not np.isnan(self.T.val0):
+            # holds the SI converted temperature guess from the seed pass
+            return self.T.val_SI
+        try:
+            if not self.h.is_var and not self.p.is_var:
+                return self.calc_T()
+            if not self.p.is_var:
+                p = self.p.val_SI
+                if self.td_bubble.is_set:
+                    return T_bubble_p(p, self.fluid_data) - self.td_bubble.val_SI
+                if self.td_dew.is_set:
+                    return T_dew_p(p, self.fluid_data) + self.td_dew.val_SI
+                if self.x.is_set:
+                    return T_dew_p(p, self.fluid_data)
+        except (ValueError, KeyError, IndexError, NotImplementedError):
+            return None
+        return None
+
+    def _p_sat_for_T(self, T):
+        """Saturation pressure at the given temperature, or None."""
+        fluid = fp.single_fluid(self.fluid_data)
+        if fluid is None:
+            return None
+        wrapper = self.fluid.wrapper[fluid]
+        if wrapper._T_crit is None or T >= wrapper._T_crit:
+            return None
+        try:
+            return p_dew_T(T, self.fluid_data)
+        except (ValueError, KeyError, IndexError, NotImplementedError):
+            return None
+
+    def _apply_temperature_field(self, field, covered, seeded):
+        """Apply the reconciled temperature of this connection.
+
+        Two phase positions receive their saturation pressure, single phase
+        positions with a declared phase the enthalpy at the reconciled
+        temperature. The assigned enthalpies are returned as sources of the
+        enthalpy propagation.
+        """
+        if self not in field:
+            return []
+        T = field[self]
+        state = self._declared_state()
+        p_on_saturation = False
+
+        two_phase = (
+            (state is not None and state["phase"] == "two-phase")
+            or self.x.is_set or self.td_bubble.is_set or self.td_dew.is_set
+            or self.state.is_set or not np.isnan(self.x.val0)
+        )
+        if two_phase and self.p.is_var:
+            reference = self.p._reference_container
+            if reference not in seeded:
+                # a subcooled or superheated port sits at its specified
+                # distance from the saturation temperature
+                T_sat = T
+                if self.td_dew.is_set:
+                    T_sat = T - self.td_dew.val_SI
+                elif self.td_bubble.is_set:
+                    T_sat = T + self.td_bubble.val_SI
+                p_sat = self._p_sat_for_T(T_sat)
+                if p_sat is not None:
+                    self.p.set_reference_val_SI(p_sat)
+                    covered.add(reference)
+        elif (
+                state is not None and state["phase"] in ("liquid", "gas")
+                and self.p.is_var
+            ):
+            reference = self.p._reference_container
+            if state.get("saturated") and reference not in seeded:
+                # the port sits on the saturation line by a component
+                # equation, so the pressure is determined by the reconciled
+                # temperature - stronger information than any propagated
+                # guess, and it keeps the side subcritical by construction.
+                # The cap holds the affine linked neighbors below the
+                # critical pressure when the field temperature approaches
+                # the critical point
+                p_sat = self._p_sat_for_T(T)
+                if p_sat is not None:
+                    fluid = fp.single_fluid(self.fluid_data)
+                    p_sat = min(p_sat, self.fluid.wrapper[fluid]._p_crit * 0.9)
+                    self.p.set_reference_val_SI(p_sat)
+                    covered.add(reference)
+                    p_on_saturation = True
+            elif reference not in covered:
+                # nothing anchored this pressure - the saturation level a
+                # few Kelvin into the declared phase region is the best
+                # information available
+                if state["phase"] == "liquid":
+                    p_sat = self._p_sat_for_T(T + 5)
+                else:
+                    p_sat = self._p_sat_for_T(T - 5)
+                if p_sat is not None:
+                    self.p.set_reference_val_SI(p_sat)
+                    covered.add(reference)
+            elif reference not in seeded:
+                # when the reconciled temperature contradicts the declared
+                # phase at the current pressure guess, the pressure is the
+                # guessed quantity and moves to the consistent saturation
+                # level
+                fluid = fp.single_fluid(self.fluid_data)
+                p_crit = (
+                    self.fluid.wrapper[fluid]._p_crit
+                    if fluid is not None else None
+                )
+                if (
+                        state["phase"] == "liquid" and p_crit is not None
+                        and self.p.val_SI >= p_crit
+                    ):
+                    # a declared liquid at supercritical pressure with a
+                    # subcritical field temperature: the propagated pressure
+                    # overshot the dome
+                    p_sat = self._p_sat_for_T(T + 5)
+                    if p_sat is not None:
+                        self.p.set_reference_val_SI(p_sat)
+                        covered.add(reference)
+                else:
+                    try:
+                        T_sat = T_dew_p(self.p.val_SI, self.fluid_data)
+                    except (ValueError, KeyError, IndexError, NotImplementedError):
+                        T_sat = None
+                    if T_sat is not None:
+                        p_sat = None
+                        if state["phase"] == "gas" and T < T_sat:
+                            p_sat = self._p_sat_for_T(T - 5)
+                        elif state["phase"] == "liquid" and T > T_sat:
+                            p_sat = self._p_sat_for_T(T + 5)
+                        if p_sat is not None:
+                            self.p.set_reference_val_SI(p_sat)
+                            covered.add(reference)
+
+        h_sources = []
+        if self.h.is_var:
+            reference = self.h._reference_container
+            declared = (
+                state is not None and state["phase"] in ("liquid", "gas")
+            )
+            if reference not in covered and (
+                    declared or self._unambiguous_single_phase(T)
+                ):
+                if p_on_saturation:
+                    # the pressure was just anchored at the saturation line
+                    # of this very temperature, so h(p, T) is ill defined -
+                    # the value comes from the saturation properties instead
+                    result = self._h_for_state(state)
+                    if result is not None:
+                        self.h.set_reference_val_SI(result[0])
+                        covered.add(reference)
+                        h_sources.append(reference)
+                    return h_sources
+                try:
+                    value = fp.h_mix_pT(
+                        self.p.val_SI, T, self.fluid_data, self.mixing_rule
+                    )
+                except (ValueError, KeyError, IndexError, NotImplementedError):
+                    if not (declared and state.get("saturated")):
+                        return h_sources
+                    # a saturated port with an externally set pressure can
+                    # still sit numerically on the line for some back ends
+                    result = self._h_for_state(state)
+                    if result is None:
+                        return h_sources
+                    value = result[0]
+                if declared:
+                    result = self._h_for_state(state)
+                    if result is not None:
+                        _, lower, upper = result
+                        if lower is not None:
+                            value = max(value, lower)
+                        if upper is not None:
+                            value = min(value, upper)
+                self.h.set_reference_val_SI(value)
+                covered.add(reference)
+                h_sources.append(reference)
+        return h_sources
+
+    def _unambiguous_single_phase(self, T):
+        """Whether pressure and temperature determine the phase without
+        ambiguity: supercritical, clear of the two phase dome, or a fluid
+        without one."""
+        fluid = fp.single_fluid(self.fluid_data)
+        if fluid is None:
+            return self.mixing_rule in _MIXING_RULE_PHASE
+        wrapper = self.fluid.wrapper[fluid]
+        if wrapper._T_crit is None:
+            return True
+        try:
+            p = self.p.val_SI
+            if p >= wrapper._p_crit:
+                return True
+            return abs(T - T_dew_p(p, self.fluid_data)) > 5
+        except (ValueError, KeyError, IndexError, NotImplementedError):
+            return False
+
+    def _state_prior(self):
+        """Enthalpy prior from the declared phase expectation, or None."""
+        state = self._declared_state()
+        if state is None:
+            return None
+        result = self._h_for_state(state)
+        if result is None:
+            return None
+        return result[0]
+
+    def _guess_starting_values(self, units, covered):
+        """Fill starting values into uncovered variables.
+
+        Mass flow gets its random value, pressure the anchors of the
+        adjacent components. Enthalpies assigned from the temperature and
+        quality precalculation and from the two phase specifications are
+        returned as sources of the enthalpy propagation; everything else
+        stays open for it.
+        """
+        # the below part does not work for PowerConnection right now
+        if sum(self.fluid.val.values()) == 0:
+            msg = (
+                'The starting value for the fluid composition of the '
+                f'connection {self.label} is empty. This might lead to issues '
+                'in the initialisation and solving process as fluid '
+                'property functions can not be called. Make sure you '
+                'specified a fluid composition in all parts of the network.'
+            )
+            logger.warning(msg)
+
+        h_sources = []
+        for key, variable in self.get_variables().items():
+            # for connections variables can be presolved and not be var anymore
+            if not variable.is_var:
+                continue
+            reference = variable._reference_container
+            if reference in covered:
+                continue
+
+            # starting value for mass flow is random between 1 and 2 kg/s
+            # (should be generated based on some hash maybe?)
+            if key == 'm':
+                rndm = seeded_random(self.label)
+                variable.set_reference_val_SI(float(rndm + 1))
+                covered.add(reference)
+
+            # generic starting values for pressure and enthalpy from
+            # component information
+            elif key == 'p':
+                val_s = self.source.initialise_source(self, key)
+                val_t = self.target.initialise_target(self, key)
+
+                if val_s == 0 and val_t == 0:
+                    value = 1e5
+                elif val_s == 0:
+                    value = val_t
+                elif val_t == 0:
+                    value = val_s
+                else:
+                    value = (val_s + val_t) / 2
+
+                variable.set_reference_val_SI(value)
+                covered.add(reference)
+
+
+        if self.h.is_var:
+            reference = self.h._reference_container
+            if self._precalc_guess_values():
+                covered.add(reference)
+                if reference not in h_sources:
+                    h_sources.append(reference)
+            # with a known pressure the two phase specifications generate
+            # an enthalpy at the dome on their own
+            seeded = (
+                self.good_starting_values or not np.isnan(self.h.val0)
+            )
+            if self._refine_two_phase_guess(seeded=seeded):
+                covered.add(reference)
+                if reference not in h_sources:
+                    h_sources.append(reference)
+
+        return h_sources
+
+    def _precalc_guess_values(self):
+        """
+        Precalculate the enthalpy value of the connection.
+
+        Precalculation is performed only if temperature or vapor mass
+        fraction is specified or provided as a guess (:code:`T0`,
+        :code:`x0`). Returns whether a value was assigned, the assigned
+        enthalpy acts as a source of the enthalpy propagation.
+        """
+        if not self.h.is_var:
+            return False
+
+        # specifications only generate a value on cold starts, an explicit
+        # guess overrides the enthalpy of a previous solution as well
+        x_active = (
+            (self.x.is_set and not self.good_starting_values)
+            or not np.isnan(self.x.val0)
+        )
+        T_active = (
+            (self.T.is_set and not self.good_starting_values)
+            or not np.isnan(self.T.val0)
+        )
+
+        assigned = False
+        if x_active:
+            fluid = fp.single_fluid(self.fluid_data)
+            if fluid is not None:
+                # a specified quality forces the solution below the critical
+                # pressure, so a supercritical guess is corrected; a quality
+                # guess must not override a user provided pressure guess -
+                # the property call below fails and the guess is dropped
+                if (
+                        self.p.is_var
+                        and (self.x.is_set or np.isnan(self.p.val0))
+                        and self.p.val_SI > self.fluid.wrapper[fluid]._p_crit
+                    ):
+                    self.p.set_reference_val_SI(self.fluid.wrapper[fluid]._p_crit * 0.9)
+                try:
+                    self.h.set_reference_val_SI(
+                        fp.h_mix_pQ(self.p.val_SI, self.x.val_SI, self.fluid_data, self.mixing_rule)
+                    )
+                    assigned = True
+                except ValueError:
+                    pass
+        if T_active:
+            try:
+                self.h.set_reference_val_SI(
+                    fp.h_mix_pT(self.p.val_SI, self.T.val_SI, self.fluid_data, self.mixing_rule)
+                )
+                assigned = True
+            except ValueError:
+                pass
+        return assigned
+
+    def _finalize_starting_values(self, units, covered, seeded, nw):
+        """Assign generic values to whatever no information reached.
+
+        Every cold guess - anything not seeded from user input or a
+        previous solution - is clamped into the valid property range and
+        the enthalpy additionally projected into the phase region the
+        adjacent components declare, so no starting value contradicts the
+        expected phase or sits on a phase boundary. Also applies the two
+        phase refinement for state and subcooling/overheating
+        specifications and backfills the user facing starting values of
+        all variables.
+        """
+        generic = {'m': 1.0, 'p': 1e5, 'h': 1e6}
+        for key, variable in self.get_variables().items():
+            if variable.is_var:
+                reference = variable._reference_container
+                if reference not in covered:
+                    variable.set_reference_val_SI(generic.get(key, 1.0))
+                    covered.add(reference)
+
+        for key, variable in self.get_variables().items():
+            if not variable.is_var or variable._reference_container in seeded:
+                continue
+            try:
+                bounds = self._property_bounds(key, nw)
+            except ValueError:
+                continue
+            if bounds is None:
+                continue
+            lower, upper = bounds
+            if lower is not None and variable.val_SI < lower:
+                variable.set_reference_val_SI(lower)
+            elif upper is not None and variable.val_SI > upper:
+                variable.set_reference_val_SI(upper)
+
+        if self.h.is_var and self.h._reference_container not in seeded:
+            state = self._declared_state()
+            if state is not None:
+                result = self._h_for_state(state)
+                if result is not None:
+                    _, lower, upper = result
+                    if lower is not None and self.h.val_SI < lower:
+                        self.h.set_reference_val_SI(lower)
+                    elif upper is not None and self.h.val_SI > upper:
+                        self.h.set_reference_val_SI(upper)
+
+        if self.h.is_var:
+            self._refine_two_phase_guess(
+                seeded=self.h._reference_container in seeded
+            )
+
+        for key, variable in self.get_variables().items():
+            if variable.is_var and np.isnan(variable.val0):
+                variable.set_val0_from_SI(units)
+
+    def _refine_two_phase_guess(self, seeded=False):
+        """Enthalpy starting value from a specification relative to
+        saturation (:code:`td_dew`, :code:`td_bubble`, :code:`state`).
+
+        The specification determines a target state at the current pressure:
+        at the specified distance from the saturation temperature for a non
+        zero temperature difference, just outside the two phase region on the
+        implied side otherwise. A seeded enthalpy (user value, previous
+        solution, :code:`init_path`) is kept while it lies on the implied side
+        of the two phase region, every other enthalpy is set to the target.
+        This is recalculated on every start, so a changed specification takes
+        effect even with good starting values.
+
+        Parameters
+        ----------
+        seeded : bool
+            Whether the enthalpy comes from a user value or a previous
+            solution.
+
+        Returns
+        -------
+        bool
+            Whether a value was assigned.
+        """
+        if not self.h.is_var:
+            return False
+        side = self._saturation_side()
+        if side is None:
+            return False
+
+        fluid = fp.single_fluid(self.fluid_data)
+        if self.p.is_var and self.p.val_SI > self.fluid.wrapper[fluid]._p_crit:
+            self.p.set_reference_val_SI(self.fluid.wrapper[fluid]._p_crit * 0.9)
+
+        p = self.p.val_SI
+        try:
+            h_edge = fp.h_mix_pQ(p, 1 if side == "gas" else 0, self.fluid_data)
+        except (ValueError, KeyError, IndexError, NotImplementedError):
+            return False
+
+        def on_side(h):
+            return h > h_edge if side == "gas" else h < h_edge
+
+        if seeded and on_side(self.h.val_SI):
+            return False
+
+        target = self._h_from_td_specification()
+        if target is None or not on_side(target):
+            target = h_edge + 1e3 if side == "gas" else h_edge - 1e3
+        self.h.set_reference_val_SI(target)
+        return True
+
+    def _saturation_side(self):
+        """Side of the two phase region a saturation relative specification
+        implies, :code:`"gas"`, :code:`"liquid"` or None."""
+        if self.state.is_set:
+            return "gas" if self.state.val == "g" else "liquid"
+        if self.td_dew.is_set:
+            return "gas" if self.td_dew.val_SI >= 0 else "liquid"
+        if self.td_bubble.is_set:
+            return "liquid" if self.td_bubble.val_SI >= 0 else "gas"
+        return None
+
+    def _h_from_td_specification(self):
+        """Enthalpy at the specified temperature difference to the dew or
+        bubble temperature at the current pressure guess, or None for a zero
+        difference, no such specification or a failed property call."""
+        p = self.p.val_SI
+        try:
+            if self.td_dew.is_set and self.td_dew.val_SI != 0:
+                T = T_dew_p(p, self.fluid_data) + self.td_dew.val_SI
+            elif self.td_bubble.is_set and self.td_bubble.val_SI != 0:
+                T = T_bubble_p(p, self.fluid_data) - self.td_bubble.val_SI
+            else:
+                return None
+            return fp.h_mix_pT(p, T, self.fluid_data, self.mixing_rule)
+        except (ValueError, KeyError, IndexError, NotImplementedError):
+            return None
+
+    def _precalc_guess_values_for_references(self):
+        """precalculate starting values for specified temperature
+        references
+        """
+        if self.T.reference.is_set:
+            ref = self.T.reference.ref
+            T_target = ref.obj.calc_T() * ref.factor + ref.delta_SI
+            h = h_mix_pT(self.p.val_SI, T_target, self.fluid_data, self.mixing_rule)
+            self.h.set_reference_val_SI(h)
+
+    def _presolve(self):
+        self._presolve_determinations = []
+        if len(self.fluid.is_var) > 0:
+            saturation = [
+                name for name in ("T_dew", "T_bubble", "x", "td_dew", "td_bubble")
+                if self.get_attr(name).is_set
+            ]
+            if saturation:
+                msg = (
+                    f"The specification of {', '.join(saturation)} at "
+                    f"connection {self.label} is not available for a variable "
+                    "fluid composition, the saturation properties of the "
+                    "mixture are unknown while its composition is a variable. "
+                    "Fix the composition or specify the state differently."
+                )
+                logger.error(msg)
+                raise TESPyNetworkError(msg)
+            return []
+
+        specifications = [
+            name for name in self._state_specifications
+            if self.property_data[name].is_set
+        ]
+
+        if len(specifications) > 2:
+            msg = (
+                "You have specified more than 2 state properties for the "
+                f"connection {self.label} with a known fluid composition: "
+                f"{', '.join(specifications)}. This overdetermines the state "
+                "of the fluid."
+            )
+            raise TESPyNetworkError(msg)
+
+        presolved_equations = []
+
+        if self.p.is_set:
+            if self.T_dew.is_set or self.T_bubble.is_set:
+                msg = (
+                    "You cannot simultaneously specify pressure and dew or "
+                    "bubble temperature as these are equivalent to setting "
+                    "pressure."
+                )
+                raise TESPyNetworkError(msg)
+
+        elif self.p.is_var:
+            if self.T_dew.is_set:
+                self._pressure_from_saturation = True
+                self.p.set_reference_val_SI(p_dew_T(self.T_dew.val_SI, self.fluid_data))
+                self.p._potential_var = False
+                if "T_dew" in self._equation_set_lookup.values():
+                    presolved_equations += ["T_dew"]
+                self._presolve_determinations.append(
+                    {"property": "p", "via": ['T_dew'], "requires": []}
+                )
+                msg = f"Determined p by specified T_dew at {self.label}."
+                logger.debug(msg)
+
+            elif self.T_bubble.is_set:
+                self._pressure_from_saturation = True
+                self.p.set_reference_val_SI(p_bubble_T(self.T_bubble.val_SI, self.fluid_data))
+                self.p._potential_var = False
+                if "T_bubble" in self._equation_set_lookup.values():
+                    presolved_equations += ["T_bubble"]
+                self._presolve_determinations.append(
+                    {"property": "p", "via": ['T_bubble'], "requires": []}
+                )
+                msg = f"Determined p by specified T_bubble at {self.label}."
+                logger.debug(msg)
+
+        elif (
+                (self.T_dew.is_set or self.T_bubble.is_set)
+                and not self._pressure_from_saturation
+        ):
+            # the pressure is fixed through another connection or equation
+            saturation = "T_dew" if self.T_dew.is_set else "T_bubble"
+            msg = (
+                f"The pressure at connection {self.label} is already "
+                "determined through other specifications, the "
+                f"{saturation} specification overdetermines it."
+            )
+            logger.error(msg)
+            raise TESPyNetworkError(msg)
+
+        if self.h.is_var and not self.p.is_var:
+            if self.T.is_set:
+                self.h.set_reference_val_SI(h_mix_pT(self.p.val_SI, self.T.val_SI, self.fluid_data, self.mixing_rule))
+                self.h._potential_var = False
+                if "T" in self._equation_set_lookup.values():
+                    presolved_equations += ["T"]
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['T'], "requires": ['p']}
+                )
+                msg = f"Determined h by known p and T at {self.label}."
+                logger.debug(msg)
+
+            elif self.td_bubble.is_set:
+                T_bubble = T_bubble_p(self.p.val_SI, self.fluid_data)
+                # fix for pure fluids: T cannot be too close to saturation
+                if abs(self.td_bubble.val_SI) <= 1e-3:
+                    # at saturation we can use h_mix_pQ
+                    self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, 0, self.fluid_data))
+                else:
+                    self.h.set_reference_val_SI(h_mix_pT(self.p.val_SI, T_bubble - self.td_bubble.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "td_bubble" in self._equation_set_lookup.values():
+                    presolved_equations += ["td_bubble"]
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['td_bubble'], "requires": ['p']}
+                )
+                msg = f"Determined h by known p and td_bubble at {self.label}."
+                logger.debug(msg)
+
+            elif self.td_dew.is_set:
+                T_dew = T_dew_p(self.p.val_SI, self.fluid_data)
+                # fix for pure fluids: T cannot be too close to saturation
+                if abs(self.td_dew.val_SI) <= 1e-3:
+                    # at saturation we can use h_mix_pQ
+                    self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, 1, self.fluid_data))
+                else:
+                    self.h.set_reference_val_SI(h_mix_pT(self.p.val_SI, T_dew + self.td_dew.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "td_dew" in self._equation_set_lookup.values():
+                    presolved_equations += ["td_dew"]
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['td_dew'], "requires": ['p']}
+                )
+                msg = f"Determined h by known p and td_dew at {self.label}."
+                logger.debug(msg)
+
+            elif self.x.is_set:
+                self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, self.x.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "x" in self._equation_set_lookup.values():
+                    presolved_equations += ["x"]
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['x'], "requires": ['p']}
+                )
+                msg = f"Determined h by known p and x at {self.label}."
+                logger.debug(msg)
+
+        elif self.h.is_var and self.p.is_var:
+            if self.T.is_set and self.x.is_set:
+                self.p.set_reference_val_SI(p_sat_TQ(self.T.val_SI, self.x.val_SI, self.fluid_data))
+                self.p._potential_var = False
+                self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, self.x.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "T" in self._equation_set_lookup.values():
+                    presolved_equations += ["T"]
+                if "x" in self._equation_set_lookup.values():
+                    presolved_equations += ["x"]
+                self._presolve_determinations.append(
+                    {"property": "p", "via": ['T', 'x'], "requires": []}
+                )
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['T', 'x'], "requires": []}
+                )
+                msg = f"Determined h and p by known T and x at {self.label}."
+                logger.debug(msg)
+
+            elif self.T.is_set and self.td_bubble.is_set:
+                self.p.set_reference_val_SI(p_bubble_T(self.T.val_SI + self.td_bubble.val_SI, self.fluid_data))
+                self.p._potential_var = False
+                if round(self.td_bubble.val_SI, 6) == 0:
+                    self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, 0, self.fluid_data))
+                else:
+                    self.h.set_reference_val_SI(h_mix_pT(self.p.val_SI, self.T.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "T" in self._equation_set_lookup.values():
+                    presolved_equations += ["T"]
+                if "td_bubble" in self._equation_set_lookup.values():
+                    presolved_equations += ["td_bubble"]
+                self._presolve_determinations.append(
+                    {"property": "p", "via": ['T', 'td_bubble'], "requires": []}
+                )
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['T', 'td_bubble'], "requires": []}
+                )
+                msg = f"Determined h and p by known T and td_bubble at {self.label}."
+                logger.debug(msg)
+
+            elif self.T.is_set and self.td_dew.is_set:
+                self.p.set_reference_val_SI(p_dew_T(self.T.val_SI - self.td_dew.val_SI, self.fluid_data))
+                self.p._potential_var = False
+                if round(self.td_dew.val_SI, 6) == 0:
+                    self.h.set_reference_val_SI(h_mix_pQ(self.p.val_SI, 1, self.fluid_data))
+                else:
+                    self.h.set_reference_val_SI(h_mix_pT(self.p.val_SI, self.T.val_SI, self.fluid_data))
+                self.h._potential_var = False
+                if "T" in self._equation_set_lookup.values():
+                    presolved_equations += ["T"]
+                if "td_dew" in self._equation_set_lookup.values():
+                    presolved_equations += ["td_dew"]
+                self._presolve_determinations.append(
+                    {"property": "p", "via": ['T', 'td_dew'], "requires": []}
+                )
+                self._presolve_determinations.append(
+                    {"property": "h", "via": ['T', 'td_dew'], "requires": []}
+                )
+                msg = f"Determined h and p by known T and td_dew at {self.label}."
+                logger.debug(msg)
+
+        presolved_equations = [
+            key for parameter in presolved_equations
+            for key, value in self._equation_set_lookup.items()
+            if value == parameter
+        ]
+        return presolved_equations
+
+    def _partial_derivative_fluid(self, var, eq_num, value, dx, increment_filter=None, **kwargs):
+        result = _partial_derivative_vecvar(var, value, dx, increment_filter, **kwargs)
+        if result is not None:
+            self.jacobian[eq_num, var.J_col[dx]] = result
+
+    def reset_fluid_vector(self):
+        self.fluid = FluidComposition(
+            d=1e-5, description="Mass fractions of the fluid composition"
+        )
+
+    def get_variables(self):
+        return {"m": self.m, "p": self.p, "h": self.h}
+
+    def _debug_state(self):
+        state = super()._debug_state()
+        try:
+            state.append(("T", self.calc_T(), None))
+        except Exception:
+            state.append(("T", None, None))
+        try:
+            state.append(("phase", self.calc_phase(), None))
+        except Exception:
+            state.append(("phase", None, None))
+        return state
+
+    def get_parameters(self):
+        return {
+            "m": ConnectionParameter(
+                quantity="mass_flow",
+                description="mass flow of the fluid (system variable)",
+                reference=ReferenceEquation(
+                    num_eq=1,
+                    func_params={"variable": "m"},
+                    structure_matrix=self.primary_ref_structure_matrix,
+                    quantity="mass_flow",
+                    description="equation for linear relationship between two mass flows"
+                )
+            ),
+            "p": ConnectionParameter(
+                quantity="pressure",
+                description="absolute pressure of the fluid (system variable)",
+                reference=ReferenceEquation(
+                    num_eq=1,
+                    func_params={"variable": "p"},
+                    structure_matrix=self.primary_ref_structure_matrix,
+                    quantity="pressure_difference",
+                    description="equation for linear relationship between two pressure values"
+                )
+            ),
+            "h": ConnectionParameter(
+                quantity="enthalpy",
+                description="mass specific enthalpy of the fluid (system variable)",
+                reference=ReferenceEquation(
+                    num_eq=1,
+                    func_params={"variable": "h"},
+                    structure_matrix=self.primary_ref_structure_matrix,
+                    quantity="enthalpy",
+                    description="equation for linear relationship between two enthalpy values"
+                )
+            ),
+            "T": ConnectionParameter(
+                func=self.T_func,
+                deriv=self.T_deriv,
+                dependents=self.T_dependents,
+                num_eq=1,
+                quantity="temperature",
+                description="temperature of the fluid",
+                reference=ReferenceEquation(
+                    func=self.T_ref_func,
+                    deriv=self.T_ref_deriv,
+                    dependents=self.T_ref_dependents,
+                    num_eq=1,
+                    quantity="temperature_difference",
+                    description="equation for linear relationship between two temperature values"
+                )
+            ),
+            "T_bubble": ConnectionParameter(
+                quantity="temperature",
+                description="determine pressure based on the provided bubble temperature of the fluid"
+            ),
+            "T_dew": ConnectionParameter(
+                quantity="temperature",
+                description="determine pressure based on the provided dew temperature of the fluid"
+            ),
+            "v": ConnectionParameter(
+                func=self.v_func, deriv=self.v_deriv,
+                dependents=self.v_dependents, num_eq=1,
+                quantity="volumetric_flow",
+                description="volumetric flow of the fluid",
+                reference=ReferenceEquation(
+                    func=self.v_ref_func,
+                    deriv=self.v_ref_deriv,
+                    dependents=self.v_ref_dependents,
+                    num_eq=1,
+                    quantity="volumetric_flow",
+                    description="equation for linear relationship between two volumetric flows"
+                )
+            ),
+            "x": ConnectionParameter(
+                func=self.x_func, deriv=self.x_deriv,
+                dependents=self.x_dependents, num_eq=1,
+                quantity="quality",
+                description="vapor mass fraction/quality of the two-phase fluid"
+            ),
+            "td_dew": ConnectionParameter(
+                func=self.td_dew_func,
+                dependents=self.td_dew_dependents,
+                num_eq=1,
+                quantity="temperature_difference",
+                description="superheating temperature difference to dew line temperature"
+            ),
+            "td_bubble": ConnectionParameter(
+                func=self.td_bubble_func, #deriv=self.td_bubble_deriv,
+                dependents=self.td_bubble_dependents,
+                num_eq=1,
+                quantity="temperature_difference",
+                description="subcooling temperature difference to bubble line temperature"
+            ),
+            "vol": ConnectionParameter(
+                quantity="specific_volume",
+                description="specific volume of the fluid",
+                calc=self._calc_vol_result
+            ),
+            "s": ConnectionParameter(
+                quantity="entropy",
+                description="specific entropy of the fluid",
+                calc=self.calc_s
+            ),
+            "fluid": FluidComposition(
+                d=1e-5, description="mass fractions of the fluid composition (system variable)"
+            ),
+            "fluid_balance": OptionalEquation(
+                func=self.fluid_balance_func, num_eq_sets=1,
+                dependents=self.fluid_balance_dependents,
+                description="apply an equation which closes the fluid balance with at least two unknown fluid mass fractions"
+            ),
+            **self._exergy_results(),
+        }
+
+    def get_fluid_data(self):
+        fluid_val = self.fluid.val
+        if self._fluid_data is None or fluid_val.keys() != self._fluid_data.keys():
+            self._fluid_data = {
+                fluid: {
+                    "wrapper": self.fluid.wrapper[fluid],
+                    "mass_fraction": fluid_val[fluid],
+                }
+                for fluid in fluid_val
+            }
+            return self._fluid_data
+        for f, data in self._fluid_data.items():
+            data["mass_fraction"] = fluid_val[f]
+        return self._fluid_data
+
+    fluid_data = property(get_fluid_data)
+
+    def calc_T(self, T0=None):
+        if T0 is None:
+            T0 = self.T.val_SI
+        return T_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, T0=T0)
+
+    def T_func(self, **kwargs):
+        r"""Equation for temperature specification
+
+        .. math::
+
+            0 = T\left(p, h\right) - T
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        return self.calc_T() - self.T.val_SI
+
+    def T_deriv(self, increment_filter, k, **kwargs):
+        if _is_variable(self.p):
+            self.jacobian[k, self.p.J_col] = (
+                dT_mix_dph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, self.T.val_SI)
+            )
+        if _is_variable(self.h):
+            self.jacobian[k, self.h.J_col] = (
+                dT_mix_pdh(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, self.T.val_SI)
+            )
+
+    def T_dependents(self):
+        return [self.p, self.h]
+
+    def T_ref_func(self, **kwargs):
+        r"""Equation for reference temperature specification :math:`T`
+
+        .. math::
+
+            0 = T\left(p, h\right) - \left[
+            T\left(p_\text{ref},h_\text{ref}\right) \cdot \text{factor} + \text{delta}
+            \right]
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        ref = self.T.reference.ref
+        return self.calc_T() - (ref.obj.calc_T() * ref.factor + ref.delta_SI)
+
+    def T_ref_deriv(self, increment_filter, k, **kwargs):
+        # first part of sum is identical to direct temperature specification
+        self.T_deriv(increment_filter, k, **kwargs)
+        ref = self.T.reference.ref
+        if _is_variable(ref.obj.p):
+            self.jacobian[k, ref.obj.p.J_col] = -(
+                dT_mix_dph(ref.obj.p.val_SI, ref.obj.h.val_SI, ref.obj.fluid_data, ref.obj.mixing_rule)
+            ) * ref.factor
+        if _is_variable(ref.obj.h):
+            self.jacobian[k, ref.obj.h.J_col] = -(
+                dT_mix_pdh(ref.obj.p.val_SI, ref.obj.h.val_SI, ref.obj.fluid_data, ref.obj.mixing_rule)
+            ) * ref.factor
+
+    def T_ref_dependents(self):
+        ref = self.T.reference.ref
+        return self.T_dependents() + ref.obj.T_dependents()
+
+    def calc_viscosity(self, T0=None, postprocess=False):
+        try:
+            return viscosity_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, T0=T0)
+        except NotImplementedError as e:
+            if postprocess:
+                return np.nan
+            else:
+                raise e
+
+    def calc_vol(self, T0=None, postprocess=False):
+        try:
+            return v_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, T0=T0)
+        except NotImplementedError as e:
+            if postprocess:
+                return np.nan
+            else:
+                raise e
+
+    def v_func(self, **kwargs):
+        r"""Equation for volumetric flow specification :math:`\dot V`
+
+        .. math::
+
+            0 = \dot m \cdot vol\left(p, h\right) - \dot V
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        return self.calc_vol(T0=self.T.val_SI) * self.m.val_SI - self.v.val_SI
+
+    def v_deriv(self, increment_filter, k, **kwargs):
+        if _is_variable(self.m):
+            self._partial_derivative(self.m, k, self.calc_vol(T0=self.T.val_SI))
+        if _is_variable(self.p):
+            self._partial_derivative(
+                self.p, k,
+                dv_mix_dph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule)
+                * self.m.val_SI
+            )
+        if _is_variable(self.h):
+            self._partial_derivative(
+                self.h, k,
+                dv_mix_pdh(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule)
+                * self.m.val_SI
+            )
+
+    def v_dependents(self):
+        return [self.m, self.p, self.h]
+
+    def v_ref_func(self, **kwargs):
+        r"""Equation for reference volumetric flow specification
+
+        .. math::
+
+            0 = \dot m \cdot vol\left(p, h\right) - \left[
+            \dot m_\text{ref} \cdot vol\left(p_\text{ref},h_\text{ref}\right)
+            \cdot \text{factor} + \text{delta}
+            \right]
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        ref = self.v.reference.ref
+        return (
+            self.calc_vol(T0=self.T.val_SI) * self.m.val_SI
+            - (
+                ref.obj.calc_vol(T0=ref.obj.T.val_SI) * ref.obj.m.val_SI
+                * ref.factor + ref.delta_SI
+            )
+        )
+
+    def v_ref_deriv(self, increment_filter, k, **kwargs):
+        # first part of sum is identical to direct volumetric flow specification
+        self.v_deriv(increment_filter, k, **kwargs)
+
+        ref = self.v.reference.ref
+        if ref.obj.m.is_var:
+            self.jacobian[k, ref.obj.m.J_col] = -(
+                ref.obj.calc_vol(T0=ref.obj.T.val_SI) * ref.factor
+            )
+        if ref.obj.p.is_var:
+            self.jacobian[k, ref.obj.p.J_col] = -(
+                dv_mix_dph(ref.obj.p.val_SI, ref.obj.h.val_SI, ref.obj.fluid_data)
+                * ref.obj.m.val_SI * ref.factor
+            )
+        if ref.obj.h.is_var:
+            self.jacobian[k, ref.obj.h.J_col] = -(
+                dv_mix_pdh(ref.obj.p.val_SI, ref.obj.h.val_SI, ref.obj.fluid_data)
+                * ref.obj.m.val_SI * ref.factor
+            )
+
+    def v_ref_dependents(self):
+        ref = self.v.reference.ref
+        return self.v_dependents() + ref.obj.v_dependents()
+
+    def calc_x(self):
+        try:
+            return Q_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data)
+        except NotImplementedError:
+            return np.nan
+
+    def x_func(self, **kwargs):
+        r"""Equation for vapor mass fraction specification :math:`x`
+
+        .. math::
+
+            0 = h - h\left(p,x\right)
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        # saturated steam fraction
+        return (
+            self.h.val_SI
+            - h_mix_pQ(self.p.val_SI, self.x.val_SI, self.fluid_data)
+        )
+
+    def x_deriv(self, increment_filter, k, **kwargs):
+        if self.p.is_var:
+            self.jacobian[k, self.p.J_col] = -dh_mix_dpQ(self.p.val_SI, self.x.val_SI, self.fluid_data)
+        if self.h.is_var:
+            self.jacobian[k, self.h.J_col] = 1
+
+    def x_dependents(self):
+        return [self.p, self.h]
+
+    def calc_T_sat(self):
+        try:
+            return T_sat_p(self.p.val_SI, self.fluid_data)
+        except NotImplementedError:
+            return np.nan
+
+    def calc_T_dew(self):
+        try:
+            return T_dew_p(self.p.val_SI, self.fluid_data)
+        except NotImplementedError:
+            return np.nan
+
+    def calc_T_bubble(self):
+        try:
+            return T_bubble_p(self.p.val_SI, self.fluid_data)
+        except NotImplementedError:
+            return np.nan
+
+    def calc_td_dew(self):
+        try:
+            return self.calc_T() - T_dew_p(self.p.val_SI, self.fluid_data)
+        except NotImplementedError:
+            return np.nan
+
+    def calc_td_bubble(self):
+        try:
+            return T_bubble_p(self.p.val_SI, self.fluid_data) - self.calc_T()
+        except NotImplementedError:
+            return np.nan
+
+    def td_dew_func(self, **kwargs):
+        r"""Equation for fixed dew temperature superheating :math:`\Delta T`
+
+        .. math::
+
+            0 = T\left(p,h\right) - T_\text{dew}\left(p\right) - \Delta T
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        return self.calc_td_dew() - self.td_dew.val_SI
+
+    def td_dew_dependents(self):
+        return [self.p, self.h]
+
+    def td_bubble_func(self, **kwargs):
+        r"""Equation for fixed bubble temperature subcooling :math:`\Delta T`
+
+        .. math::
+
+            0 = T_\text{bubble}\left(p\right) - T\left(p,h\right) - \Delta T
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        return self.calc_td_bubble() - self.td_bubble.val_SI
+
+    def td_bubble_dependents(self):
+        return [self.p, self.h]
+
+    def fluid_balance_func(self, **kwargs):
+        r"""Equation for fluid vector balance
+
+        .. math::
+
+            0 = 1 - \sum x_\text{fluid_i}
+
+        Returns
+        -------
+        float
+            residual value of equation
+        """
+        residual = 1 - sum(self.fluid.val[f] for f in self.fluid.is_set)
+        residual -= sum(self.fluid.val[f] for f in self.fluid.is_var)
+        return residual
+
+    def fluid_balance_dependents(self):
+        return {
+            "scalars": [[]],
+            "vectors": [{self.fluid: self.fluid.is_var}]
+        }
+
+    def calc_s(self):
+        try:
+            return s_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule, T0=self.T.val_SI)
+        except NotImplementedError:
+            return np.nan
+
+    def _calc_vol_result(self):
+        # method called indirectly through .calc, need to provide kwargs
+        return self.calc_vol(T0=self.T.val_SI, postprocess=True)
+
+    def calc_Q(self):
+        return Q_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data)
+
+    def calc_phase(self):
+        try:
+            return phase_mix_ph(self.p.val_SI, self.h.val_SI, self.fluid_data, self.mixing_rule)
+        except NotImplementedError:
+            return np.nan
+
+    def calc_results(self, units, skip_postprocess):
+        self.reset_optional_results()
+        self.m.set_val0_from_SI(units)
+        self.p.set_val0_from_SI(units)
+        self.h.set_val0_from_SI(units)
+        self.fluid.val0 = self.fluid.val.copy()
+        # temperature and quality guesses are one-shot: consumed by this
+        # solve, the next warm start continues from the solution; a failed
+        # solve does not reach this point and keeps them for the retry
+        for name in ("T", "x"):
+            prop = self.property_data.get(name)
+            if prop is not None:
+                prop.val0 = np.nan
+
+        if skip_postprocess:
+            return True
+
+        self.T.val_SI = self.calc_T()
+        fluid = single_fluid(self.fluid_data)
+        _converged = True
+        if fluid is None:
+            # this is a mixture
+            h_from_T = h_mix_pT(self.p.val_SI, self.T.val_SI, self.fluid_data, self.mixing_rule)
+            if (
+                abs(h_from_T - self.h.val_SI) > ERR ** .5 and
+                abs((h_from_T - self.h.val_SI) / self.h.val_SI) > ERR ** .5
+            ):
+                self.T.val_SI = np.nan
+                self.vol.val_SI = np.nan
+                self.v.val_SI = np.nan
+                self.s.val_SI = np.nan
+                msg = (
+                    "Could not find a feasible value for mixture temperature "
+                    f"at connection {self.label}. The values of temperature, "
+                    "specific volume and entropy are set to nan."
+                )
+                logger.error(msg)
+                _converged = False
+            else:
+                _, Tmax = get_mixture_temperature_range(self.fluid_data)
+                if self.T.val_SI > Tmax:
+                    msg = (
+                        "The temperature value of the mixture is above the "
+                        "upper temperature limit of a mixture component. The "
+                        "resulting temperature may have larger deviations "
+                        "compared to the tolerance specified in the "
+                        "corresponding substance property library."
+                    )
+                    logger.warning(msg)
+
+        # all properties from pressure and enthalpy first, they reuse the
+        # state the property back end holds from the temperature calculation
+        if _converged:
+            self._calc_result_parameters()
+            self.v.val_SI = self.vol.val_SI * self.m.val_SI
+
+        if fluid is not None:
+            # these are pure fluids
+            # two-phase properties are calculated based on pressure
+            if self.p.val_SI < self.fluid.wrapper[fluid]._p_crit:
+                try:
+                    self.x.val_SI = self.calc_x()
+                except ValueError:
+                    self.x.val_SI = np.nan
+
+                try:
+                    self.phase.val = self.calc_phase()
+                except ValueError:
+                    self.phase.val = "phase not recognized"
+
+                try:
+                    T_bubble = T_bubble_p(self.p.val_SI, self.fluid_data)
+                    # T_sat = T_bubble!
+                    T_dew = T_dew_p(self.p.val_SI, self.fluid_data)
+                    self.td_dew.val_SI = self.T.val_SI - T_dew
+                    self.td_bubble.val_SI = T_bubble - self.T.val_SI
+                    self.T_bubble.val_SI = T_bubble
+                    self.T_dew.val_SI = T_dew
+
+                except (ValueError, NotImplementedError):
+                    self.td_dew.val_SI = np.nan
+                    self.td_bubble.val_SI = np.nan
+            else:
+                self.x.val_SI = np.nan
+                self.phase.val = "phase not recognized"
+
+        for prop in self._result_attributes():
+            param = self.get_attr(prop)
+            if param.is_set:
+                result = param.value_from_SI(units)
+                if not np.isclose(result, param.val, 1e-3, 1e-3):
+                    _converged = False
+                    msg = (
+                        "The simulation converged but the calculated result "
+                        f"{result} {param.unit} for the fixed input parameter "
+                        f"{prop} of "
+                        f"connection {self.label} is not equal to the originally "
+                        f"specified value of {param.val}. Usually, this can "
+                        "happen, when a method internally manipulates the "
+                        "associated equation during iteration in order to allow "
+                        "progress in situations, when the equation is otherwise "
+                        "not well defined for the current values of the "
+                        "variables, e.g. in case a negative root would need to be "
+                        "evaluated. Often, this can happen during the first "
+                        "iterations and then will resolve itself as convergence "
+                        "progresses. In this case it did not, meaning convergence "
+                        "was not actually achieved."
+                    )
+                    logger.warning(msg)
+            else:
+                param.set_val_from_SI(units)
+
+        return _converged
+
+    def _set_design_params(self, data, units):
+        super()._set_design_params(data, units)
+        for fluid in self.fluid.val:
+            self.fluid.design[fluid] = float(data[fluid])
+
+    def _set_starting_values(self, data, units):
+        super()._set_starting_values(data, units)
+        for fluid in self.fluid.is_var:
+            self.fluid.val[fluid] = float(data[fluid])
+            self.fluid.val0[fluid] = float(self.fluid.val[fluid])
+
+    @classmethod
+    def _result_attributes(cls):
+        return ["m", "p", "h", "T", "v", "s", "vol", "x", "td_dew", "td_bubble", "T_dew", "T_bubble"]
+
+    @classmethod
+    def _get_result_cols(cls, all_fluids):
+        return [
+            col for prop in cls._result_attributes()
+            for col in [prop, f"{prop}_unit"]
+        ] + list(all_fluids) + ['phase', 'source', 'source_id', 'target', 'target_id']
+
+    @classmethod
+    def _print_attributes(cls):
+        return ["m", "p", "h", "T", "x", "phase"]
+
+    def collect_results(self, all_fluids):
+        return [
+            _ for key in self._result_attributes()
+            for _ in [self.get_attr(key).val, self.get_attr(key).unit]
+        ] + [
+            self.fluid.val[fluid] if fluid in self.fluid.val else np.nan
+            for fluid in all_fluids
+        ] + [
+            self.phase.val,
+            self.source.label,
+            self.source_id,
+            self.target.label,
+            self.target_id,
+        ]
+
+    def _property_bounds(self, prop, nw):
+        r"""
+        Bounds of a variable in the value space of this connection.
+
+        Returns a tuple with the minimum and maximum value, :code:`None` in
+        place of an unbounded side, or :code:`None` if the property is not
+        bounded on this connection.
+        """
+        if prop == "m":
+            return nw.m_range_SI
+
+        fl = fp.single_fluid(self.fluid_data)
+
+        # pure fluid
+        if fl is not None:
+            wrapper = self.fluid.wrapper[fl]
+            if prop == "p":
+                lower = None
+                if self.p.val_SI < wrapper._p_min:
+                    try:
+                        # if this works, the temperature is higher than the
+                        # minimum temperature, we can access pressure values
+                        # below minimum pressure
+                        wrapper.T_ph(self.p.val_SI, self.h.val_SI)
+                    except ValueError:
+                        lower = wrapper._p_min + 1e1
+                upper = wrapper._p_max
+                # two phase specifications evaluate saturation properties,
+                # which only exist below the critical pressure. The margin
+                # is kept tiny so no legitimate trajectory or solution is
+                # affected, only the property domain is protected
+                if (
+                        self.x.is_set or self.td_bubble.is_set
+                        or self.td_dew.is_set or self.state.is_set
+                    ):
+                    upper = min(upper, wrapper._p_crit * 0.999)
+                # a port on the saturation line by a component equation
+                # requires a subcritical pressure for the saturation
+                # properties to exist; the margin is kept tiny so
+                # legitimate near-critical condensation stays feasible
+                for comp, port in (
+                        (self.source, self.source_id),
+                        (self.target, self.target_id)
+                    ):
+                    claim = comp.initial_state(port)
+                    if claim is not None and claim.get("saturated"):
+                        upper = min(upper, wrapper._p_crit * 0.999)
+                return lower, upper
+
+            elif prop == "h":
+                T = wrapper._T_min + 1e-1
+                # the minimum temperature is not accessible at every
+                # pressure, e.g. below the melting line
+                while True:
+                    try:
+                        hmin = wrapper.h_pT(self.p.val_SI, T)
+                        break
+                    except ValueError as e:
+                        T *= 1.05
+                        if T > wrapper._T_max:
+                            raise ValueError(e) from e
+
+                T = wrapper._T_max
+                # T_max depends on pressure for incompressibles
+                while True:
+                    try:
+                        hmax = wrapper.h_pT(self.p.val_SI, T)
+                        break
+                    except ValueError as e:
+                        T *= 0.99
+                        if T < wrapper._T_min:
+                            raise ValueError(e) from e
+
+                d = self.h._reference_container._d
+                # cap the inside offset so it stays a nudge into the valid
+                # range and a runaway enthalpy value cannot invert or
+                # excessively shrink the interval
+                delta = min(
+                    max(abs(self.h.val_SI * d), d) * 5, (hmax - hmin) / 100
+                )
+                lower, upper = hmin + delta, hmax - delta
+
+                if (
+                        self.state.is_set and self.it < 30
+                        and self.p.val_SI < wrapper._p_crit
+                    ):
+                    if self.state.val == "g":
+                        lower = max(lower, wrapper.h_pQ(self.p.val_SI, 1))
+                    else:
+                        upper = min(upper, wrapper.h_pQ(self.p.val_SI, 0))
+
+                return lower, upper
+
+        # mixture
+        elif self.it < 5 and not self.good_starting_values:
+            if prop == "p":
+                return nw.p_range_SI
+
+            elif prop == "h":
+                lower, upper = nw.h_range_SI
+                if self.T.is_set:
+                    Tmin = max(
+                        w._T_min for f, w in self.fluid.wrapper.items()
+                        if self.fluid.val[f] > ERR
+                    ) * 1.01
+                    Tmax = min(
+                        w._T_max for f, w in self.fluid.wrapper.items()
+                        if self.fluid.val[f] > ERR
+                    ) * 0.99
+                    lower = max(lower, h_mix_pT(
+                        self.p.val_SI, Tmin, self.fluid_data, self.mixing_rule
+                    ))
+                    upper = min(upper, h_mix_pT(
+                        self.p.val_SI, Tmax, self.fluid_data, self.mixing_rule
+                    ))
+                return lower, upper
+
+        return None
+
+    def _adjust_to_property_limits(self, nw):
+        fl = fp.single_fluid(self.fluid_data)
+        if fl is None or not self.h.is_var:
+            return
+
+        if (self.state.is_set or self.x.is_set or self.td_bubble.is_set or self.td_dew.is_set) and self.it < 30:
+            self._adjust_to_two_phase(fl)
+
+    def _adjust_to_two_phase(self, fluid):
+
+        if self.p.val_SI > self.fluid.wrapper[fluid]._p_crit:
+            self.p.set_reference_val_SI(self.fluid.wrapper[fluid]._p_crit * 0.9)
+        # this is supposed to never be accessed with INCOMP backend but it is
+        # not enforced. With INCOMP backend this causes a crash
+        if self.td_bubble.is_set:
+            # very strictly modifying h to target value
+            if abs(self.td_bubble.val_SI) < 1e-3:
+                if self.td_bubble.val_SI >= 0:
+                    h = self.fluid.wrapper[fluid].h_pQ(self.p.val_SI, 0)
+                else:
+                    h = self.fluid.wrapper[fluid].h_pQ(self.p.val_SI, 1)
+            else:
+                T_bubble = self.fluid.wrapper[fluid].T_bubble(self.p.val_SI)
+                h = self.fluid.wrapper[fluid].h_pT(
+                    self.p.val_SI, T_bubble - self.td_bubble.val_SI
+                )
+            self.h.set_reference_val_SI(h)
+
+        elif self.td_dew.is_set:
+            # very strictly modifying h to target value
+            if abs(self.td_dew.val_SI) < 1e-3:
+                if self.td_dew.val_SI >= 0:
+                    h = self.fluid.wrapper[fluid].h_pQ(self.p.val_SI, 1)
+                else:
+                    h = self.fluid.wrapper[fluid].h_pQ(self.p.val_SI, 0)
+            else:
+                T_dew = self.fluid.wrapper[fluid].T_dew(self.p.val_SI)
+                h = self.fluid.wrapper[fluid].h_pT(
+                    self.p.val_SI, T_dew + self.td_dew.val_SI
+                )
+            self.h.set_reference_val_SI(h)
+
+        elif self.x.is_set:
+            h = self.fluid.wrapper[fluid].h_pQ(self.p.val_SI, self.x.val_SI)
+            self.h.set_reference_val_SI(h)
+
+    def _property_range_message(self, prop):
+        r"""
+        Return debugging message for fluid property range adjustments.
+
+        Parameters
+        ----------
+        c : tespy.connections.connection.Connection
+            Connection to check fluid properties.
+
+        prop : str
+            Fluid property.
+
+        Returns
+        -------
+        msg : str
+            Debugging message.
+        """
+        msg = (
+            f"{self.get_attr(prop).quantity} out of fluid property range at "
+            f"connection {self.label}, adjusting value to "
+            f"{self.get_attr(prop).val_SI}."
+        )
+        return msg
+
+    @staticmethod
+    def _exergy_results():
+        return {
+            "e_T": OptionalResult(
+                quantity="specific_energy",
+                description="specific thermal exergy"
+            ),
+            "e_M": OptionalResult(
+                quantity="specific_energy",
+                description="specific mechanical exergy"
+            ),
+            "e_PH": OptionalResult(
+                quantity="specific_energy",
+                description="specific physical exergy"
+            ),
+            "E_T": OptionalResult(
+                quantity="power",
+                description="thermal exergy flow"
+            ),
+            "E_M": OptionalResult(
+                quantity="power",
+                description="mechanical exergy flow"
+            ),
+            "E_PH": OptionalResult(
+                quantity="power",
+                description="physical exergy flow"
+            ),
+        }
+
+    def _get_physical_exergy(self, pamb, Tamb):
+        r"""
+        Calculate the physical exergy of the connection.
+
+        The results are stored in the optional result parameters
+        :code:`e_T`, :code:`e_M`, :code:`e_PH` (specific exergy) and
+        :code:`E_T`, :code:`E_M`, :code:`E_PH` (exergy flow), in SI units
+        and in the units of the network of the last calculation.
+
+        Parameters
+        ----------
+        pamb : float, pint.Quantity
+            Ambient pressure, a plain number in Pa.
+
+        Tamb : float, pint.Quantity
+            Ambient temperature, a plain number in K.
+
+        Note
+        ----
+            .. math::
+
+                e^\text{PH} = e^\text{T} + e^\text{M}\\
+                E^\text{T} = \dot{m} \cdot e^\text{T}\\
+                E^\text{M} = \dot{m} \cdot e^\text{M}\\
+                E^\text{PH} = \dot{m} \cdot e^\text{PH}
+        """
+        if isinstance(pamb, pint.Quantity):
+            pamb = pamb.to("Pa").magnitude
+        if isinstance(Tamb, pint.Quantity):
+            Tamb = Tamb.to("K").magnitude
+        e_T, e_M = fp.functions.calc_physical_exergy(
+            self.h.val_SI, self.s.val_SI, self.p.val_SI, pamb, Tamb,
+            self.fluid_data, self.mixing_rule, self.T.val_SI
+        )
+        units = self.m._units
+        values = {
+            "e_T": e_T, "e_M": e_M, "e_PH": e_T + e_M,
+            "E_T": e_T * self.m.val_SI, "E_M": e_M * self.m.val_SI,
+            "E_PH": (e_T + e_M) * self.m.val_SI,
+        }
+        for key, value in values.items():
+            self.get_attr(key).set_from_SI(value, units)
+        self._optional_results_stale = True
+
+    def _deprecated_exergy_value(self, old, new):
+        warnings.warn(
+            f"The attribute '{old}' is deprecated and will be removed in "
+            f"version 0.13, use '{new}.val_SI' instead.",
+            FutureWarning, stacklevel=3
+        )
+        return self.get_attr(new).val_SI
+
+    ex_therm = property(lambda self: self._deprecated_exergy_value("ex_therm", "e_T"))
+    ex_mech = property(lambda self: self._deprecated_exergy_value("ex_mech", "e_M"))
+    ex_physical = property(lambda self: self._deprecated_exergy_value("ex_physical", "e_PH"))
+    Ex_therm = property(lambda self: self._deprecated_exergy_value("Ex_therm", "E_T"))
+    Ex_mech = property(lambda self: self._deprecated_exergy_value("Ex_mech", "E_M"))
+    Ex_physical = property(lambda self: self._deprecated_exergy_value("Ex_physical", "E_PH"))
+
+
+class Ref:
+    r"""
+    A reference object is used to reference (unknown) properties of connections
+    to other connections.
+
+    For example, reference the mass flow of one connection :math:`\dot{m}` to
+    another mass flow :math:`\dot{m}_{ref}`:
+
+    .. math::
+
+        \dot{m} = \dot{m}_\text{ref} \cdot \text{factor} + \text{delta}
+
+    Parameters
+    ----------
+    obj : tespy.connections.connection.Connection
+        Connection to be referenced.
+
+    factor : float
+        Factor to multiply specified property with.
+
+    delta : float, pint.Quantity
+        Delta to add after multiplication. Plain numeric value uses the
+        network's default unit.
+    """
+
+    def __init__(self, ref_obj, factor, delta):
+
+        if not isinstance(ref_obj, ConnectionBase):
+            msg = 'First parameter must be object of type connection.'
+            logger.error(msg)
+            raise TypeError(msg)
+
+        if not (isinstance(factor, int) or isinstance(factor, float)):
+            msg = 'Second parameter must be of type int or float.'
+            logger.error(msg)
+            raise TypeError(msg)
+
+        if not isinstance(delta, (int, float, pint.Quantity)):
+            msg = (
+                "Third parameter must be of type int, float or pint.Quantity."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+        self.obj = ref_obj
+        self.factor = factor
+        self.delta = delta
+        self.delta_SI = None
+        self._delta_unit = None
+
+        msg = (
+            f"Created reference object with factor {self.factor} and delta "
+            f"{self.delta} referring to connection {ref_obj.label}"
+        )
+        logger.debug(msg)
+
+    def __repr__(self):
+        return _display_repr(self)
+
+    __str__ = __repr__
+
+    def _repr_compact(self):
+        return (
+            f"{type(self).__name__}({self.obj.label!r}, "
+            f"factor={self.factor}, delta={self.delta})"
+        )
+
+    def get_attr(self, key):
+        r"""
+        Get the value of a reference attribute.
+
+        Parameters
+        ----------
+        key : str
+            The attribute you want to retrieve.
+
+        Returns
+        -------
+        out :
+            Specified attribute.
+        """
+        if key in self.__dict__:
+            return self.__dict__[key]
+        else:
+            msg = f"Reference has no attribute '{key}'."
+            logger.error(msg)
+            raise KeyError(msg)

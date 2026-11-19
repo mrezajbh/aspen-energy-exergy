@@ -1,0 +1,352 @@
+# -*- coding: utf-8
+
+"""Module of class Merge.
+
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location tespy/components/nodes/merge.py
+
+SPDX-License-Identifier: MIT
+"""
+
+import numpy as np
+
+from tespy.components.component import component_registry
+from tespy.components.nodes.base import NodeBase
+from tespy.tools.data_containers import ConfigParameter
+from tespy.tools.data_containers import MandatoryConstraint
+from tespy.tools.fluid_properties import s_mix_pT
+
+
+@component_registry
+class Merge(NodeBase):
+    r"""
+    Class for merge points with multiple inflows and one outflow.
+
+    .. image:: /api/_images/components/Merge.svg
+       :alt: flowsheet of the merge
+       :align: center
+       :class: only-light
+
+    .. image:: /api/_images/components/Merge_darkmode.svg
+       :alt: flowsheet of the merge
+       :align: center
+       :class: only-dark
+
+    Ports
+    -----
+
+    - Fluid inlets: in1, in2, ... (variable, count set by :code:`num_in`)
+    - Fluid outlets: out1
+
+    Mandatory Equations
+    -------------------
+
+    - mass balance constraint: :py:meth:`mass_flow_func <tespy.components.nodes.base.NodeBase.mass_flow_func>`
+    - fluid mass fraction balance constraints: :py:meth:`fluid_func <tespy.components.nodes.merge.Merge.fluid_func>`
+    - energy balance constraint: :py:meth:`energy_balance_func <tespy.components.nodes.merge.Merge.energy_balance_func>`
+    - pressure equality constraints: :py:meth:`pressure_structure_matrix <tespy.components.nodes.base.NodeBase.pressure_structure_matrix>`
+
+    Parameters
+    ----------
+
+    char_warnings : bool
+        Ignore warnings on default characteristics usage for this component.
+
+    design : list
+        List containing design parameters (stated as String).
+
+    design_path : str
+        Path to the components design case.
+
+    label : str
+        The label of the component.
+
+    local_design : bool
+        Treat this component in design mode in an offdesign calculation.
+
+    local_offdesign : bool
+        Treat this component in offdesign mode in a design calculation.
+
+    num_in : int
+        Number of inlets.
+
+    offdesign : list
+        List containing offdesign parameters (stated as String).
+
+    printout : bool
+        Include this component in the network's results printout.
+
+    Example
+    -------
+    The merge mixes a specified number of mass flows and has a single outlet.
+    At the outlet, fluid composition and enthalpy are calculated by mass
+    weighted fluid composition and enthalpy of the inlets.
+
+    >>> from tespy.components import Sink, Source, Merge
+    >>> from tespy.connections import Connection
+    >>> from tespy.networks import Network
+    >>> nw = Network(iterinfo=False)
+    >>> nw.units.set_defaults(**{
+    ...     "pressure": "bar", "pressure_difference": "bar"
+    ... })
+    >>> so1 = Source('source1')
+    >>> so2 = Source('source2')
+    >>> so3 = Source('source3')
+    >>> si1 = Sink('sink')
+    >>> m = Merge('merge', num_in=3)
+    >>> inc1 = Connection(so1, 'out1', m, 'in1')
+    >>> inc2 = Connection(so2, 'out1', m, 'in2')
+    >>> inc3 = Connection(so3, 'out1', m, 'in3')
+    >>> outg = Connection(m, 'out1', si1, 'in1')
+    >>> nw.add_conns(inc1, inc2, inc3, outg)
+
+    Consider a merge with three inlets which mixes three mass flows of the
+    same fluid. In this case, the outlet mass flow will be the sum of both
+    inlet mass flows and the outlet enthalpy will be the weighted sum of the
+    inlet enthalpies. The pressure is equal for all connections of the merge
+    imposed by the component's mandatory constraints.
+
+    >>> T = 293.15
+    >>> inc1.set_attr(fluid={'O2': 1}, p=1, T=300, m=5)
+    >>> inc2.set_attr(fluid={'O2': 1}, T=450, m=5)
+    >>> inc3.set_attr(fluid={'O2': 1}, T=350, m=5)
+    >>> nw.solve('design')
+    >>> round(outg.m.val_SI, 1)
+    15.0
+    >>> round(outg.h.val_SI, 0)
+    334919.0
+    >>> round(outg.T.val_SI, 0)
+    367.0
+
+    We could also fix the outlet temperature and by that determine a missing
+    mass flow, e.g. the hottest incoming stream.
+
+    >>> outg.set_attr(T=360)
+    >>> inc2.set_attr(m=None)
+    >>> nw.solve("design")
+    >>> round(inc2.m.val_SI, 1)
+    3.8
+
+    More interesting things can happen, if we want to take the fluid
+    composition into account. For example, air (O2 + N2) is mixed with pure
+    nitrogen and pure oxygen flows. At the outlet we want to have a new mixture
+    with a fixed amount of nitrogen, e.g. 40 %. All gases enter the component
+    at the same temperature. When changing the fluids, we have to rerun the
+    network fluid detection, which is part of the topological setup. This
+    usually only happens if you run a network with changed topology.
+
+    >>> T = 293.15
+    >>> inc1.reset_fluid_vector()
+    >>> inc2.reset_fluid_vector()
+    >>> inc3.reset_fluid_vector()
+    >>> outg.reset_fluid_vector()
+    >>> inc1.set_attr(fluid={'O2': 0.23, 'N2': 0.77}, p=1, T=T, m=5)
+    >>> inc2.set_attr(fluid={'O2': 1}, T=T, m=5)
+    >>> inc3.set_attr(fluid={'N2': 1}, T=T, m=None)
+    >>> outg.set_attr(fluid={'N2': 0.4}, T=None)
+    >>> nw.solve('design')
+    >>> m_expected = (
+    ...     (inc1.fluid.val["O2"] * inc1.m.val_SI + inc2.m.val_SI)
+    ...     / (1 - outg.fluid.val["N2"])
+    ... )
+    >>> round(outg.m.val_SI, 2) == round(m_expected, 2)
+    True
+    >>> abs((outg.T.val_SI - T) / T) < 0.01
+    True
+
+    >>> T = 173.15
+    >>> inc1.set_attr(T=T)
+    >>> inc2.set_attr(T=T)
+    >>> inc3.set_attr(T=T)
+    >>> nw.solve('design')
+    >>> abs((outg.T.val_SI - T) / T) < 0.01
+    True
+    """
+
+    @staticmethod
+    def get_parameters():
+        return {'num_in': ConfigParameter(dtype="int", description="number of inlets")}
+
+    @classmethod
+    def port_schema(cls):
+        return {
+            "inlets": {"type": "variable", "parameter": "num_in", "pattern": "in{n}", "min": 2},
+            "outlets": {"type": "fixed", "ports": ["out1"]},
+            "powerinlets": {"type": "fixed", "ports": []},
+            "poweroutlets": {"type": "fixed", "ports": []},
+            "heatinlets": {"type": "fixed", "ports": []},
+            "heatoutlets": {"type": "fixed", "ports": []},
+        }
+
+    def _update_num_eq(self):
+        self.variable_fluids = set(
+            [fluid for c in self.inl + self.outl for fluid in c.fluid.is_var]
+        )
+        set_fluids = set(
+            [fluid for c in self.inl + self.outl for fluid in c.fluid.is_set]
+        )
+        if len(self.variable_fluids) == 0 and len(set_fluids) == 0:
+            self._balance_fluids = []
+            self.constraints["mass_flow_constraints"].num_eq = 1
+        elif len(self.variable_fluids) == 0:
+            self._balance_fluids = sorted(set_fluids)
+            self.constraints["mass_flow_constraints"].num_eq = 0
+        else:
+            self._balance_fluids = sorted(self.variable_fluids)
+        self.constraints["fluid_constraints"].num_eq = len(self._balance_fluids)
+
+    def get_mandatory_constraints(self):
+        return {
+            'mass_flow_constraints': MandatoryConstraint(**{
+                'num_eq_sets': 1,
+                'func': self.mass_flow_func,
+                'dependents': self.mass_flow_dependents,
+                'description': 'mass balance constraint'
+            }),
+            'fluid_constraints': MandatoryConstraint(**{
+                'num_eq_sets': 1,
+                'func': self.fluid_func,
+                'dependents': self.fluid_dependents,
+                'description': 'fluid mass fraction balance constraints'
+            }),
+            'energy_balance_constraints': MandatoryConstraint(**{
+                'num_eq_sets': 1,
+                'func': self.energy_balance_func,
+                'dependents': self.energy_balance_dependents,
+                'description': 'energy balance constraint'
+            }),
+            'pressure_constraints': MandatoryConstraint(**{
+                'structure_matrix': self.pressure_structure_matrix,
+                'num_eq_sets': self.num_i + self.num_o - 1,
+                'description': 'pressure equality constraints'
+            })
+        }
+
+    def inlets(self):
+        if self.num_in.is_set:
+            return [f'in{i + 1}' for i in range(self.num_in.val)]
+        else:
+            self.set_attr(num_in=2)
+            return self.inlets()
+
+    @staticmethod
+    def outlets():
+        return ['out1']
+
+    def fluid_func(self):
+        r"""
+        Calculate the vector of residual values for fluid balance equations.
+
+        Returns
+        -------
+        residual : list
+            Vector of residual values for component's fluid balance.
+
+            .. math::
+
+                0 = \sum_i \dot{m}_{in,i} \cdot x_{fl,in,i} -
+                \dot {m}_{out} \cdot x_{fl,out}\\
+                \forall fl \in \text{network fluids},
+                \; \forall i \in \text{inlets}
+        """
+        residual = []
+        # we take the total mass flow to handle more than one outlet if necessary
+        total_mass_flow = sum([c.m.val_SI for c in self.outl])
+        for fluid in self._balance_fluids:
+            res = -self.outl[0].fluid.val.get(fluid, 0) * total_mass_flow
+            for i in self.inl:
+                res += i.fluid.val.get(fluid, 0) * i.m.val_SI
+            residual += [res]
+        return residual
+
+    def fluid_dependents(self):
+        return {
+            "scalars": [
+                [c.m for c in self.inl + self.outl] for f in self._balance_fluids
+            ],
+            "vectors": [{
+                c.fluid: {f} & c.fluid.is_var for c in self.inl + self.outl[:1]
+            } for f in self._balance_fluids]
+        }
+
+    def energy_balance_func(self):
+        r"""
+        Calculate energy balance.
+
+        Returns
+        -------
+        residual : float
+            Residual value of energy balance.
+
+            .. math::
+
+                0 = \sum_i \left(\dot{m}_{in,i} \cdot h_{in,i} \right) -
+                \dot{m}_{out} \cdot h_{out}\\
+                \forall i \in \text{inlets}
+        """
+        # we take the total mass flow to handle more than one outlet if necessary
+        total_mass_flow = sum([c.m.val_SI for c in self.outl])
+        res = -total_mass_flow * self.outl[0].h.val_SI
+        for i in self.inl:
+            res += i.m.val_SI * i.h.val_SI
+        return res
+
+    def energy_balance_dependents(self):
+        dependents = []
+        for c in self.inl + self.outl:
+            dependents += [c.m, c.h]
+        return dependents
+
+    def entropy_balance(self):
+        r"""
+        Calculate entropy balance of a merge.
+
+        Note
+        ----
+        A definition of reference points is included for compensation of
+        differences in zero point definitions of different fluid compositions.
+
+        - Reference temperature: 298.15 K.
+        - Reference pressure: 1 bar.
+
+        .. math::
+
+            \dot{S}_\text{irr}= \dot{m}_\text{out} \cdot
+            \left( s_\text{out} - s_\text{out,ref} \right)
+            - \sum_{i} \dot{m}_{\text{in,}i} \cdot
+            \left( s_{\text{in,}i} - s_{\text{in,ref,}i} \right)\\
+        """
+        T_ref = 298.15
+        p_ref = 1e5
+        o = self.outl[0]
+        self.S_irr = o.m.val_SI * (
+            o.s.val_SI - s_mix_pT(p_ref, T_ref, o.fluid_data, o.mixing_rule)
+        )
+        for i in self.inl:
+            self.S_irr -= i.m.val_SI * (
+                i.s.val_SI - s_mix_pT(p_ref, T_ref, i.fluid_data, i.mixing_rule)
+            )
+
+    def get_plotting_data(self):
+        """Generate a dictionary containing FluProDia plotting information.
+
+        Returns
+        -------
+        data : dict
+            A nested dictionary containing the keywords required by the
+            :code:`calc_individual_isoline` method of the
+            :code:`FluidPropertyDiagram` class. First level keys are the
+            connection index ('in1' -> 'out1', therefore :code:`1` etc.).
+        """
+        return {
+            i + 1: {
+                'isoline_property': 'p',
+                'isoline_value': self.inl[i].p.val,
+                'isoline_value_end': self.outl[0].p.val,
+                'starting_point_property': 'vol',
+                'starting_point_value': self.inl[i].vol.val,
+                'ending_point_property': 'vol',
+                'ending_point_value': self.outl[0].vol.val
+            } for i in range(self.num_i)}

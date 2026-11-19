@@ -1,0 +1,239 @@
+# -*- coding: utf-8
+
+"""Module for class SubsystemInterface.
+
+
+This file is part of project TESPy (github.com/oemof/tespy). It's copyrighted
+by the contributors recorded in the version control history of the file,
+available from its original location
+tespy/components/basics/subsystem_interface.py
+
+SPDX-License-Identifier: MIT
+"""
+
+from tespy.components.component import Component
+from tespy.components.component import component_registry
+from tespy.tools.data_containers import ConfigParameter
+from tespy.tools.data_containers import MandatoryConstraint
+
+
+@component_registry
+class SubsystemInterface(Component):
+    r"""
+    The subsystem interface does not change fluid properties.
+
+    .. image:: /api/_images/components/SubsystemInterface.svg
+       :alt: flowsheet of the subsysteminterface
+       :align: center
+       :class: only-light
+
+    .. image:: /api/_images/components/SubsystemInterface_darkmode.svg
+       :alt: flowsheet of the subsysteminterface
+       :align: center
+       :class: only-dark
+
+    Ports
+    -----
+
+    - Fluid inlets: in1, in2, ... (variable, count set by :code:`num_inter`)
+    - Fluid outlets: out1, out2, ... (variable, count set by :code:`num_inter`)
+    - Power inlets: power_in1, power_in2, ... (variable, count set by :code:`num_power_inter`)
+    - Power outlets: power_out1, power_out2, ... (variable, count set by :code:`num_power_inter`)
+    - Heat inlets: heat_in1, heat_in2, ... (variable, count set by :code:`num_heat_inter`)
+    - Heat outlets: heat_out1, heat_out2, ... (variable, count set by :code:`num_heat_inter`)
+
+    Mandatory Equations
+    -------------------
+
+    - mass flow equality constraint(s): :py:meth:`variable_equality_structure_matrix <tespy.components.component.Component.variable_equality_structure_matrix>`
+    - fluid composition equality constraint(s): :py:meth:`variable_equality_structure_matrix <tespy.components.component.Component.variable_equality_structure_matrix>`
+    - pressure equality constraint: :py:meth:`variable_equality_structure_matrix <tespy.components.component.Component.variable_equality_structure_matrix>`
+    - enthalpy equality constraint: :py:meth:`variable_equality_structure_matrix <tespy.components.component.Component.variable_equality_structure_matrix>`
+
+    Parameters
+    ----------
+
+    char_warnings : bool
+        Ignore warnings on default characteristics usage for this component.
+
+    design : list
+        List containing design parameters (stated as String).
+
+    design_path : str
+        Path to the components design case.
+
+    label : str
+        The label of the component.
+
+    local_design : bool
+        Treat this component in design mode in an offdesign calculation.
+
+    local_offdesign : bool
+        Treat this component in offdesign mode in a design calculation.
+
+    num_heat_inter : int
+        Number of heat interfacing connections.
+
+    num_inter : int
+        Number of interfacing connections.
+
+    num_power_inter : int
+        Number of power interfacing connections.
+
+    offdesign : list
+        List containing offdesign parameters (stated as String).
+
+    printout : bool
+        Include this component in the network's results printout.
+
+    Notes
+    -----
+
+    .. note::
+
+        This component passes all fluid properties and mass flow from its inlet to
+        the outlet.
+
+    Example
+    -------
+    As connections can only connect a component with a different
+    component, the subsystem interface is used to connect subsystems with the
+    rest of your network. It is necessary to specify the number of interfaces
+    of the subsystem interface, if you want any number other than 1. We will
+    not go in depth of subsystem usage in this example. Please refer to
+    :ref:`this section <modules_subsystems_label>` for more information
+    on building your own subsystems.
+
+    >>> from tespy.components import Sink, Source, SubsystemInterface
+    >>> from tespy.connections import Connection
+    >>> from tespy.networks import Network
+    >>> nw = Network(iterinfo=False)
+    >>> nw.units.set_defaults(**{
+    ...     "pressure": "bar", "pressure_difference": "bar",
+    ...     "temperature": "degC", "enthalpy": "kJ/kg"
+    ... })
+    >>> so1 = Source('source 1')
+    >>> si1 = Sink('sink 1')
+    >>> so2 = Source('source 2')
+    >>> si2 = Sink('sink 2')
+    >>> IF = SubsystemInterface('subsystem interface', num_inter=2)
+    >>> len(IF.inlets())
+    2
+
+    The interface does not change the fluid properties in any way.
+
+    >>> inc1 = Connection(so1, 'out1', IF, 'in1')
+    >>> outg1 = Connection(IF, 'out1', si1, 'in1')
+    >>> inc2 = Connection(so2, 'out1', IF, 'in2')
+    >>> outg2 = Connection(IF, 'out2', si2, 'in1')
+    >>> nw.add_conns(inc1, outg1, inc2, outg2)
+    >>> inc1.set_attr(fluid={'H2O': 1}, T=40, p=3, m=100)
+    >>> inc2.set_attr(fluid={'N2': 1}, T=60, p=1)
+    >>> outg2.set_attr(v=10)
+    >>> nw.solve('design')
+    >>> inc1.m.val_SI == outg1.m.val_SI
+    True
+    >>> inc2.m.val_SI == outg2.m.val_SI
+    True
+    >>> inc1.h.val_SI == outg1.h.val_SI
+    True
+    >>> inc2.h.val_SI == outg2.h.val_SI
+    True
+    """
+
+    def get_mandatory_constraints(self):
+        constraints = super().get_mandatory_constraints()
+        constraints.update({
+            "pressure_equality_constraint": MandatoryConstraint(**{
+                "num_eq_sets": self.num_i,
+                "structure_matrix": self.variable_equality_structure_matrix,
+                "func_params": {"variable": "p"},
+                "description": "pressure equality constraint"
+            }),
+            "enthalpy_equality_constraint": MandatoryConstraint(**{
+                "num_eq_sets": self.num_i,
+                "structure_matrix": self.variable_equality_structure_matrix,
+                "func_params": {"variable": "h"},
+                "description": "enthalpy equality constraint"
+            })
+        })
+        if self.num_power_i > 0:
+            constraints["power_equality_constraint"] = MandatoryConstraint(**{
+                "num_eq_sets": self.num_power_i,
+                "structure_matrix": self.power_equality_structure_matrix,
+                "description": "power equality constraint"
+            })
+        if self.num_heat_i > 0:
+            constraints["heat_equality_constraint"] = MandatoryConstraint(**{
+                "num_eq_sets": self.num_heat_i,
+                "structure_matrix": self.heat_equality_structure_matrix,
+                "description": "heat equality constraint"
+            })
+        return constraints
+
+    def power_equality_structure_matrix(self, k, **kwargs):
+        for count, (i, o) in enumerate(zip(self.power_inl, self.power_outl)):
+            self._structure_matrix[k + count, i.E.sm_col] = 1
+            self._structure_matrix[k + count, o.E.sm_col] = -1
+
+    def heat_equality_structure_matrix(self, k, **kwargs):
+        for count, (i, o) in enumerate(zip(self.heat_inl, self.heat_outl)):
+            self._structure_matrix[k + count, i.E.sm_col] = 1
+            self._structure_matrix[k + count, o.E.sm_col] = -1
+
+    @staticmethod
+    def get_parameters():
+        return {
+            "num_inter": ConfigParameter(
+                dtype="int", description="number of interfacing connections"
+            ),
+            "num_power_inter": ConfigParameter(
+                dtype="int", description="number of power interfacing connections"
+            ),
+            "num_heat_inter": ConfigParameter(
+                dtype="int", description="number of heat interfacing connections"
+            ),
+        }
+
+    @classmethod
+    def port_schema(cls):
+        return {
+            "inlets": {"type": "variable", "parameter": "num_inter", "pattern": "in{n}", "min": 1},
+            "outlets": {"type": "variable", "parameter": "num_inter", "pattern": "out{n}", "min": 1},
+            "powerinlets": {"type": "variable", "parameter": "num_power_inter", "pattern": "power_in{n}", "min": 0},
+            "poweroutlets": {"type": "variable", "parameter": "num_power_inter", "pattern": "power_out{n}", "min": 0},
+            "heatinlets": {"type": "variable", "parameter": "num_heat_inter", "pattern": "heat_in{n}", "min": 0},
+            "heatoutlets": {"type": "variable", "parameter": "num_heat_inter", "pattern": "heat_out{n}", "min": 0},
+        }
+
+    def inlets(self):
+        if self.num_inter.is_set:
+            return [f"in{i + 1}" for i in range(self.num_inter.val)]
+        else:
+            return ['in1']
+
+    def outlets(self):
+        if self.num_inter.is_set:
+            return [f"out{i + 1}" for i in range(self.num_inter.val)]
+        else:
+            return ['out1']
+
+    def powerinlets(self):
+        if self.num_power_inter.is_set:
+            return [f'power_in{i + 1}' for i in range(self.num_power_inter.val)]
+        return []
+
+    def poweroutlets(self):
+        if self.num_power_inter.is_set:
+            return [f'power_out{i + 1}' for i in range(self.num_power_inter.val)]
+        return []
+
+    def heatinlets(self):
+        if self.num_heat_inter.is_set:
+            return [f'heat_in{i + 1}' for i in range(self.num_heat_inter.val)]
+        return []
+
+    def heatoutlets(self):
+        if self.num_heat_inter.is_set:
+            return [f'heat_out{i + 1}' for i in range(self.num_heat_inter.val)]
+        return []

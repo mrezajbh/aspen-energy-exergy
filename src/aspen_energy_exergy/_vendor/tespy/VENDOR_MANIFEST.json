@@ -1,0 +1,86 @@
+{
+  "project": "TESPy",
+  "version": "0.12.0.post1",
+  "source_url": "https://files.pythonhosted.org/packages/43/09/c5cbb127e269e40457e4eec53f99f0b31ed7c20eec15f4156cd2b00f8242/tespy-0.12.0.post1-py3-none-any.whl",
+  "sha256": "a6739d2f26e20922404aff94a4d8f4b26d062dc85c477cb99d2ad5e93848c775",
+  "pypi_requires": [
+    "CoolProp>=6.8",
+    "fluprodia>=4.1.2",
+    "jinja2",
+    "matplotlib>=3.2.1",
+    "numpy>=1.13.3",
+    "pandas>=1.3.0",
+    "pint",
+    "scipy",
+    "tabulate>=0.8.2",
+    "tespy[docs,test]; extra == \"dev\"",
+    "build; extra == \"dev\"",
+    "check-manifest; extra == \"dev\"",
+    "flit; extra == \"dev\"",
+    "isort; extra == \"dev\"",
+    "tox; extra == \"dev\"",
+    "twine; extra == \"dev\"",
+    "exerpy; extra == \"docs\"",
+    "furo; extra == \"docs\"",
+    "myst-nb; extra == \"docs\"",
+    "pymoo; extra == \"docs\"",
+    "sphinx>=7.2.2; extra == \"docs\"",
+    "sphinx-copybutton; extra == \"docs\"",
+    "sphinx-design; extra == \"docs\"",
+    "sphinx-notfound-page>=1.1.0; extra == \"docs\"",
+    "sphinx-reredirects; extra == \"docs\"",
+    "sphinxcontrib.bibtex>=2.0; extra == \"docs\"",
+    "thermopack>=2.2; extra == \"docs\"",
+    "pymoo; extra == \"opt\"",
+    "exerpy; extra == \"test\"",
+    "ht; extra == \"test\"",
+    "iapws; extra == \"test\"",
+    "pymoo; extra == \"test\"",
+    "pyromat; extra == \"test\"",
+    "pytest; extra == \"test\"",
+    "pytest-cov; extra == \"test\"",
+    "thermopack>=2.2; extra == \"test\""
+  ],
+  "profile": "Aspen-only import guards; no property engine emulation",
+  "changed_files": [
+    "tools/fluid_properties/functions.py",
+    "tools/fluid_properties/mixtures.py",
+    "connections/humidairconnection.py",
+    "tools/global_vars.py",
+    "tools/fluid_properties/helpers.py",
+    "tools/fluid_properties/wrappers/coolprop.py"
+  ],
+  "unchanged_native_equation_files": [
+    {
+      "file": "components/energy/_bus.py",
+      "sha256": "c4b9084c56eae44b35990b67360068b0c084018407238279c3013acf3b41336c",
+      "byte_identical": true
+    },
+    {
+      "file": "components/heat_exchangers/simple.py",
+      "sha256": "9394fce5916c660a04a7b7366fef4bc83219fbd39a92bb9a5faa90946984c026",
+      "byte_identical": true
+    },
+    {
+      "file": "components/heat_exchangers/base.py",
+      "sha256": "db44c6da828365bb48156d2bae516f753c4de509c9ce80054ed7d9a09f449945",
+      "byte_identical": true
+    },
+    {
+      "file": "components/turbomachinery/base.py",
+      "sha256": "03474fafb217b58746b5de0119095aca48ea0590f18b1e64ff375b2e79c5c01e",
+      "byte_identical": true
+    },
+    {
+      "file": "components/nodes/merge.py",
+      "sha256": "d950c71e38ff908482d9d7ea55766e53c77d9e0879e3bf25768d6be4dab8858b",
+      "byte_identical": true
+    },
+    {
+      "file": "components/nodes/droplet_separator.py",
+      "sha256": "09046e12b8feb65ac482d5501eb39346d0f211aa7f55d3a3f6fe067323210ca4",
+      "byte_identical": true
+    }
+  ],
+  "strict_limitation": "Balance evaluation only; no TESPy process solve or property flash is claimed."
+}
